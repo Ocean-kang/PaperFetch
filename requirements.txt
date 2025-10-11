@@ -1,35 +1,35 @@
-antlr4-python3-runtime @ file:///home/conda/feedstock_root/build_artifacts/antlr-python-runtime-meta_1638309185939/work
-Brotli @ file:///D:/bld/brotli-split_1756599174049/work
+antlr4-python3-runtime
+Brotli
 cachetools==6.2.0
-certifi @ file:///home/conda/feedstock_root/build_artifacts/certifi_1759648874697/work/certifi
-cffi @ file:///D:/bld/cffi_1758716094419/work
-charset-normalizer @ file:///home/conda/feedstock_root/build_artifacts/charset-normalizer_1754767332901/work
+certifi
+cffi
+charset-normalizer
 cssselect==1.3.0
 cssutils==2.11.1
-feedparser @ file:///home/conda/feedstock_root/build_artifacts/feedparser_1757939047061/work
-h2 @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_h2_1756364871/work
-hpack @ file:///home/conda/feedstock_root/build_artifacts/hpack_1737618293087/work
-hyperframe @ file:///home/conda/feedstock_root/build_artifacts/hyperframe_1737618333194/work
-idna @ file:///home/conda/feedstock_root/build_artifacts/idna_1733211830134/work
+feedparser 
+h2
+hpack
+hyperframe
+idna
 lxml==6.0.2
 more-itertools==10.8.0
-numpy @ file:///D:/bld/bld/rattler-build_numpy_1757504921/work/dist/numpy-2.3.3-cp312-cp312-win_amd64.whl#sha256=8396faad196ae7f420d91a6cbeba6feb7ec3669202e23bae1e3ae4d5bb14e721
-omegaconf @ file:///home/conda/feedstock_root/build_artifacts/omegaconf_1670575376789/work
-pandas @ file:///D:/bld/pandas_1759265573875/work
+numpy
+omegaconf
+pandas
 premailer==3.10.0
-pycparser @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_pycparser_1733195786/work
-PySocks @ file:///D:/bld/pysocks_1733217287171/work
-python-dateutil @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_python-dateutil_1751104122/work
-pytz @ file:///home/conda/feedstock_root/build_artifacts/pytz_1742920838005/work
-PyYAML @ file:///D:/bld/pyyaml_1758891545897/work
-requests @ file:///home/conda/feedstock_root/build_artifacts/requests_1755614211359/work
+pycparser
+PySocks
+python-dateutil
+pytz
+PyYAML
+requests
 setuptools==80.9.0
-sgmllib3k @ file:///home/conda/feedstock_root/build_artifacts/sgmllib3k_1734543040599/work
-six @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_six_1753199211/work
-typing_extensions @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_typing_extensions_1756220668/work
-tzdata @ file:///home/conda/feedstock_root/build_artifacts/python-tzdata_1742745135198/work
-urllib3 @ file:///home/conda/feedstock_root/build_artifacts/urllib3_1750271362675/work
+sgmllib3k
+six
+typing_extensions
+tzdata
+urllib3
 wheel==0.45.1
-win_inet_pton @ file:///D:/bld/win_inet_pton_1733130564612/work
-yagmail @ file:///home/conda/feedstock_root/build_artifacts/yagmail_1733708880136/work
+win_inet_pton
+yagmail
 zstandard==0.25.0
