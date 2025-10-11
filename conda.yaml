@@ -1,7 +1,6 @@
 name: paperfetch
 channels:
-  - https://mirrors.ustc.edu.cn/anaconda/cloud/conda-forge
-  - nodefaults
+  - conda-forge
 dependencies:
   - python=3.12
   - feedparser
