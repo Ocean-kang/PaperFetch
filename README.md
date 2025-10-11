@@ -4,11 +4,18 @@
 ##  Environment Setup
 
 1. Clone the repository:
-    > git clone https://github.com/Ocean-kang/PaperFetch.git
+    ```sh
+    git clone https://github.com/Ocean-kang/PaperFetch.git
+    ```
 
-2. Install the python packages:
-    > cd PaperFetch
+2. Create a conda environment:
+    ```sh
+    conda env create -f conda.yaml
+    conda activate paperfetch
+    ```
 
-    > conda env create -f conda.yaml
-    
-    > pip install -r requirements.txt
+3. Install the python packages:
+
+    ```sh
+    pip install -r requirements.txt
+    ```
