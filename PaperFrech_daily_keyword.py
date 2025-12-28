@@ -17,7 +17,7 @@ CONFIGPATH = f'./config/'
 # arXiv 查询设置
 CATEGORIES = ["cs.CV", "cs.CL", "cs.AI"]   # 查询类别
 KEYWORDS = ["open vocabulary semantic segmentation", "open-vocabulary semantic segmentation"]  # 查询关键词
-DAYS = 1             # 最近几天的论文
+DAYS = 20             # 最近几天的论文
 MAX_RESULTS = 100    # 每个类别最大返回论文数
 
 # Email Setting
