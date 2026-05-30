@@ -9,6 +9,8 @@ import re
 import yagmail
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from omegaconf import OmegaConf 
 
 CONFIGPATH = f'./config/'
@@ -19,6 +21,8 @@ CATEGORIES = ["cs.CV", "cs.CL", "cs.AI"]   # 查询类别
 KEYWORDS = ["open vocabulary semantic segmentation", "open-vocabulary semantic segmentation"]  # 查询关键词
 DAYS = 20             # 最近几天的论文
 MAX_RESULTS = 100    # 每个类别最大返回论文数
+MAX_PAGES = 5         # 最多翻页次数，避免近期论文超过单页上限时漏抓
+REQUEST_TIMEOUT = 30
 
 # Email Setting
 emailfile = f'MyEmail.yaml'
@@ -62,20 +66,37 @@ def build_arxiv_url(category, keywords, start=0, max_results=50):
     inner = make_arxiv_inner_clause(keywords)
     raw_query = f"cat:{category} AND ({inner})"
     encoded_query = quote_plus(raw_query)
-    base_url = "http://export.arxiv.org/api/query?"
+    base_url = "https://export.arxiv.org/api/query?"
     return (f"{base_url}search_query={encoded_query}"
             f"&start={start}&max_results={max_results}"
             f"&sortBy=submittedDate&sortOrder=descending")
 
 
 def fetch_feed_with_retry(url, max_retries=3, delay=2):
-    """带重试的 feedparser 请求"""
+    """带重试的 feedparser 请求；请求失败时不要伪装成空结果。"""
+    last_error = None
     for attempt in range(max_retries):
-        feed = feedparser.parse(url)
-        if feed.entries:
+        try:
+            req = Request(
+                url,
+                headers={
+                    "User-Agent": "PaperFetch/1.0 (arXiv daily digest; contact: local-user)"
+                },
+            )
+            with urlopen(req, timeout=REQUEST_TIMEOUT) as response:
+                data = response.read()
+
+            feed = feedparser.parse(data)
+            if getattr(feed, "bozo", False):
+                last_error = getattr(feed, "bozo_exception", "feed parse error")
+                raise RuntimeError(f"arXiv feed parse failed: {last_error}")
             return feed
-        time.sleep(delay)
-    return feedparser.parse(url)
+        except (HTTPError, URLError, TimeoutError, RuntimeError) as exc:
+            last_error = exc
+            if attempt < max_retries - 1:
+                time.sleep(delay * (attempt + 1))
+
+    raise RuntimeError(f"Failed to fetch arXiv feed after {max_retries} retries: {last_error}")
 
 
 def keyword_in_text(text, kw):
@@ -86,44 +107,69 @@ def keyword_in_text(text, kw):
 
 def keyword_match(entry, keywords):
     """标题/摘要匹配关键词"""
-    text = (entry.title + " " + entry.summary).lower()
+    text = (entry.get("title", "") + " " + entry.get("summary", "")).lower()
     return any(keyword_in_text(text, kw) for kw in keywords)
 
 
+def entry_recent_time(entry):
+    """取论文 published/updated 中较新的时间，避免更新论文被 published 过滤掉。"""
+    candidates = []
+    for key in ("published", "updated"):
+        value = entry.get(key)
+        if not value:
+            continue
+        try:
+            candidates.append(datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc))
+        except ValueError:
+            continue
+    return max(candidates) if candidates else None
+
+
 # ---------- 主爬取函数 ----------
-def fetch_arxiv_papers(keywords, categories, days=1, max_results=100):
+def fetch_arxiv_papers(keywords, categories, days=1, max_results=100, max_pages=MAX_PAGES):
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     papers, seen = [], set()
 
     for cat in categories:
-        url = build_arxiv_url(cat, keywords, start=0, max_results=max_results)
-        feed = fetch_feed_with_retry(url)
+        for page in range(max_pages):
+            start = page * max_results
+            url = build_arxiv_url(cat, keywords, start=start, max_results=max_results)
+            feed = fetch_feed_with_retry(url)
 
-        for e in feed.entries:
-            try:
-                published = datetime.strptime(e.published, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-            except Exception:
-                continue
+            if not feed.entries:
+                break
 
-            if published < cutoff:
-                continue
-            if not keyword_match(e, keywords):
-                continue
+            reached_old_entries = False
+            for e in feed.entries:
+                recent_time = entry_recent_time(e)
+                if recent_time is None:
+                    continue
 
-            title = e.title.strip().replace("\n", " ")
-            key = (title, published.strftime("%Y-%m-%d"))
-            if key in seen:
-                continue
-            seen.add(key)
+                if recent_time < cutoff:
+                    reached_old_entries = True
+                    continue
+                if not keyword_match(e, keywords):
+                    continue
 
-            papers.append({
-                "title": title,
-                "authors": ", ".join(a.name for a in e.authors),
-                "summary": re.sub(r"\s+", " ", e.summary.strip()),
-                "published": published.strftime("%Y-%m-%d"),
-                "category": cat,
-                "link": e.link
-            })
+                title = e.get("title", "").strip().replace("\n", " ")
+                key = e.get("id") or e.get("link") or (title, recent_time.strftime("%Y-%m-%d"))
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                papers.append({
+                    "title": title,
+                    "authors": ", ".join(a.name for a in e.get("authors", [])),
+                    "summary": re.sub(r"\s+", " ", e.get("summary", "").strip()),
+                    "published": recent_time.strftime("%Y-%m-%d"),
+                    "category": cat,
+                    "link": e.get("link", "")
+                })
+
+            if reached_old_entries:
+                break
+
+            time.sleep(3)
 
     # Sorted by Dates
     papers.sort(key=lambda x: x["published"], reverse=True)
