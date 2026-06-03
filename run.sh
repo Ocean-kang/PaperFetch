@@ -22,7 +22,7 @@ echo "USER=$(id -un)"
 
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
-    echo "Another PaperFetch job is running, skip."
+    echo "Another PaperFetch is already running, exit."
     echo "===== PaperFetch SKIP $(date '+%F %T %z') ====="
     exit 0
 fi

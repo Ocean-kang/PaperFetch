@@ -177,12 +177,18 @@ bash run.sh
 Example cron entry:
 
 ```bash
-0 9 * * * /bin/bash -lc '/root/code/PaperFetch/run.sh' >> /root/code/PaperFetch/cron.log 2>&1
+30 18 * * * /bin/bash -lc 'cd /root/code/PaperFetch && bash run.sh' >> /root/code/PaperFetch/cron.log 2>&1
 ```
 
-Do not keep a test schedule such as `* * * * *` for PaperFetch in production. The `run.sh`
-wrapper also uses `flock` so an accidental high-frequency cron entry will not run concurrent
-jobs.
+Recommended frequency is once per day, or at most once every 12 hours:
+
+```bash
+30 9,21 * * * /bin/bash -lc 'cd /root/code/PaperFetch && bash run.sh' >> /root/code/PaperFetch/cron.log 2>&1
+```
+
+Do not keep a test schedule such as `* * * * *` or `*/5 * * * *` for PaperFetch in production.
+High-frequency runs can trigger arXiv HTTP 429 rate limits. The `run.sh` wrapper also uses
+`flock` so an accidental high-frequency cron entry will not run concurrent jobs.
 
 Useful deployment checks:
 
@@ -357,7 +363,7 @@ tail -200 /root/code/PaperFetch/log/run.log
 Run two wrapper processes at the same time to verify locking. The second process should log:
 
 ```text
-Another PaperFetch job is running, skip.
+Another PaperFetch is already running, exit.
 ```
 
 ## Examples

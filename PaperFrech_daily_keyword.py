@@ -67,6 +67,8 @@ DAYS = 20
 MAX_RESULTS = 100
 REQUEST_TIMEOUT = 30
 MIN_ARXIV_INTERVAL_SECONDS = 3.5
+KEYWORD_BATCH_SIZE = 5
+BATCH_SLEEP_SECONDS = 10
 USER_AGENT = "PaperFetch/1.0 contact: oymk66666@outlook.com"
 SMTP_HOST = "smtp.qq.com"
 SMTP_PORT = 465
@@ -152,6 +154,12 @@ def build_arxiv_url(categories: list[str], keywords: list[str], days: int, max_r
     return url, raw_query
 
 
+def chunked(items: list[str], size: int) -> list[list[str]]:
+    if size < 1:
+        raise ValueError("chunk size must be >= 1")
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
 def wait_for_arxiv_rate_limit() -> None:
     global LAST_ARXIV_REQUEST_TS
     now = time.monotonic()
@@ -235,8 +243,12 @@ def load_cache(path: Path) -> list[dict[str, Any]] | None:
         return None
     with path.open("r", encoding="utf-8") as fp:
         payload = json.load(fp)
+    papers = payload.get("papers", [])
+    if not papers:
+        LOGGER.info("ignoring empty arXiv cache: %s", path)
+        return None
     LOGGER.info("loaded arXiv cache: %s", path)
-    return payload.get("papers", [])
+    return papers
 
 
 def write_cache(path: Path, raw_query: str, papers: list[dict[str, Any]]) -> None:
@@ -330,39 +342,69 @@ def fetch_arxiv_papers(
     max_results: int,
     no_cache: bool,
 ) -> list[dict[str, Any]]:
-    url, raw_query = build_arxiv_url(categories, keywords, days, max_results)
-    path = cache_path(raw_query)
-    LOGGER.info("arXiv query: %s", raw_query)
-    LOGGER.info("arXiv query URL: %s", url[:300])
+    batches = chunked(keywords, KEYWORD_BATCH_SIZE)
+    papers_by_id: dict[str, dict[str, Any]] = {}
+    failures: list[str] = []
+    successful_batches = 0
 
-    if not no_cache:
-        cached = load_cache(path)
-        if cached is not None:
-            return cached
+    for index, batch in enumerate(batches, 1):
+        url, raw_query = build_arxiv_url(categories, batch, days, max_results)
+        path = cache_path(raw_query)
+        LOGGER.info("arXiv keyword batch %s/%s size=%s", index, len(batches), len(batch))
+        LOGGER.info("arXiv query: %s", raw_query)
+        LOGGER.info("arXiv query URL: %s", url[:300])
 
-    try:
-        data = rate_limited_fetch(url)
-        feed = parse_feed(data)
-        papers = papers_from_feed(feed, keywords)
-        LOGGER.info("final matched paper count=%s", len(papers))
-        if not no_cache and papers:
-            write_cache(path, raw_query, papers)
-        elif not no_cache:
-            LOGGER.info("skip writing empty arXiv cache")
-        return papers
-    except Exception:
         if not no_cache:
             cached = load_cache(path)
             if cached is not None:
-                LOGGER.warning("WARNING: arXiv fetch failed, fallback to cache")
-                return cached
-        raise
+                successful_batches += 1
+                for paper in cached:
+                    papers_by_id[paper["arxiv_id"]] = paper
+                continue
+
+        try:
+            data = rate_limited_fetch(url)
+            feed = parse_feed(data)
+            batch_papers = papers_from_feed(feed, batch)
+            successful_batches += 1
+            LOGGER.info("batch %s matched paper count=%s", index, len(batch_papers))
+            for paper in batch_papers:
+                papers_by_id[paper["arxiv_id"]] = paper
+
+            if not no_cache and batch_papers:
+                write_cache(path, raw_query, batch_papers)
+            elif not no_cache:
+                LOGGER.info("No papers found for batch %s, skip writing empty cache.", index)
+        except Exception as exc:
+            message = f"batch {index}/{len(batches)} failed: {exc!r}"
+            failures.append(message)
+            LOGGER.exception("arXiv keyword batch failed: %s", message)
+
+        if index < len(batches):
+            LOGGER.info("sleep %.2fs before next keyword batch", BATCH_SLEEP_SECONDS)
+            time.sleep(BATCH_SLEEP_SECONDS)
+
+    if successful_batches == 0:
+        detail = "; ".join(failures) if failures else "no keyword batches completed"
+        raise RuntimeError(f"Failed to fetch arXiv feed for all keyword batches: {detail}")
+
+    if failures:
+        LOGGER.warning("arXiv completed with %s failed keyword batch(es)", len(failures))
+
+    papers = list(papers_by_id.values())
+    papers.sort(key=lambda item: item["published"], reverse=True)
+    LOGGER.info("final matched paper count=%s", len(papers))
+    return papers
 
 
 def build_email_subject(papers: list[dict[str, Any]], days: int) -> str:
     if papers:
         return f"PaperFetch: 最近 {days} 天找到 {len(papers)} 篇相关论文"
     return f"PaperFetch: 最近 {days} 天未找到匹配论文"
+
+
+def build_failure_subject(days: int) -> str:
+    return f"PaperFetch: arXiv 请求失败（最近 {days} 天）"
 
 
 def build_empty_report(keywords: list[str], categories: list[str], days: int) -> str:
@@ -380,6 +422,33 @@ def build_empty_report(keywords: list[str], categories: list[str], days: int) ->
             f"- 运行时间：{run_time}",
             "",
             "这表示程序运行成功，但本次查询没有匹配结果；这不是程序错误。",
+        ]
+    )
+
+
+def build_failure_report(
+    error: Exception,
+    keywords: list[str],
+    categories: list[str],
+    days: int,
+    max_results: int,
+) -> str:
+    run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return "\n".join(
+        [
+            "# PaperFetch Run Failed",
+            "",
+            "PaperFetch started, but failed while requesting arXiv, so no paper results were produced.",
+            "",
+            f"- Error type: {type(error).__name__}",
+            f"- Error message: {error}",
+            f"- Search window: last {days} days",
+            f"- max_results: {min(max_results, 100)}",
+            f"- arXiv categories: {', '.join(categories)}",
+            f"- Keyword count: {len(keywords)}",
+            f"- Run time: {run_time}",
+            "",
+            "This is usually caused by arXiv API rate limiting, a network timeout, or temporary connectivity trouble. It is not an email configuration error if you received this message.",
         ]
     )
 
@@ -435,13 +504,31 @@ def main() -> int:
     categories = [category.strip() for category in CATEGORIES if category.strip()]
     LOGGER.info("starting PaperFetch days=%s max_results=%s", args.days, min(args.max_results, 100))
 
-    papers = fetch_arxiv_papers(
-        keywords=keywords,
-        categories=categories,
-        days=args.days,
-        max_results=args.max_results,
-        no_cache=args.no_cache,
-    )
+    should_send_email = not args.dry_run and not args.no_email
+
+    try:
+        papers = fetch_arxiv_papers(
+            keywords=keywords,
+            categories=categories,
+            days=args.days,
+            max_results=args.max_results,
+            no_cache=args.no_cache,
+        )
+    except Exception as exc:
+        LOGGER.exception("Failed to fetch arXiv papers")
+        subject = build_failure_subject(args.days)
+        report = build_failure_report(exc, keywords, categories, args.days, args.max_results)
+        if should_send_email:
+            try:
+                send_email(subject, report)
+                LOGGER.info("failure email sent to configured receiver")
+            except Exception:
+                LOGGER.exception("Failed to send failure notification email")
+        else:
+            LOGGER.info("failure email not sent because dry_run=%s no_email=%s", args.dry_run, args.no_email)
+            LOGGER.debug("generated failure report:\n%s", report)
+        return 1
+
     LOGGER.info("final paper count=%s", len(papers))
 
     if not papers:
@@ -449,7 +536,6 @@ def main() -> int:
 
     report = generate_markdown(papers, keywords, categories, args.days)
     subject = build_email_subject(papers, args.days)
-    should_send_email = not args.dry_run and not args.no_email
     LOGGER.info("send_email=%s dry_run=%s no_email=%s", should_send_email, args.dry_run, args.no_email)
 
     if should_send_email:
