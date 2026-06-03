@@ -1,4 +1,3 @@
-cat > /root/code/PaperFetch/run.sh <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -9,18 +8,24 @@ PY="/root/miniconda3/envs/paperfetch/bin/python"
 SCRIPT="$ROOT/PaperFrech_daily_keyword.py"
 LOG_DIR="$ROOT/log"
 LOG_FILE="$LOG_DIR/run.log"
+LOCK_FILE="/tmp/paperfetch.lock"
 
 mkdir -p "$LOG_DIR"
 cd "$ROOT"
 
-# 从这里开始，所有 shell 输出和 Python 输出都进入 run.log
 exec >> "$LOG_FILE" 2>&1
 
 echo
 echo "===== PaperFetch START $(date '+%F %T %z') ====="
 echo "PWD=$(pwd)"
 echo "USER=$(id -un)"
-echo "PATH=$PATH"
+
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "Another PaperFetch job is running, skip."
+    echo "===== PaperFetch SKIP $(date '+%F %T %z') ====="
+    exit 0
+fi
 
 trap 'code=$?; echo "===== PaperFetch ERROR $(date "+%F %T %z") ====="; echo "line=$LINENO"; echo "cmd=$BASH_COMMAND"; echo "exit=$code"; exit $code' ERR
 
@@ -32,9 +37,8 @@ fi
 source "$CONDA_SH"
 conda activate "$CONDA_ENV"
 
-echo "Conda env: $CONDA_DEFAULT_ENV"
-echo "Python from command: $(command -v python)"
-echo "Python explicit: $PY"
+echo "Conda env: ${CONDA_DEFAULT_ENV:-unknown}"
+echo "Python: $PY"
 "$PY" --version
 
 if [[ ! -x "$PY" ]]; then
@@ -44,12 +48,10 @@ fi
 
 if [[ ! -f "$SCRIPT" ]]; then
     echo "ERROR: script not found: $SCRIPT"
-    echo "Current directory files:"
+    echo "Files in project root:"
     ls -lah "$ROOT"
     exit 12
 fi
-
-echo "Running script: $SCRIPT"
 
 set +e
 timeout 600 "$PY" "$SCRIPT"
@@ -65,6 +67,3 @@ elif [[ "$code" -ne 0 ]]; then
 fi
 
 echo "===== PaperFetch END $(date '+%F %T %z') exit=0 ====="
-EOF
-
-chmod +x /root/code/PaperFetch/run.sh

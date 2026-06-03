@@ -1,118 +1,234 @@
 """
-PaperFetch_daily.py
-自动爬取 arXiv 上最新的相关论文并发送 Markdown 格式邮件
+Fetch recent arXiv papers by keyword/category and send one daily Markdown digest.
 """
 
-import feedparser
-import time
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import random
 import re
-import yagmail
+import socket
+import time
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote_plus
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
-from omegaconf import OmegaConf 
 
-CONFIGPATH = f'./config/'
+CONFIG_DIR = Path("./config")
+CACHE_DIR = Path("./cache")
+EMAIL_CONFIG = CONFIG_DIR / "MyEmail.yaml"
 
-# ========== 🧩 用户配置区域 ==========
-# arXiv 查询设置
-CATEGORIES = ["cs.CV", "cs.CL", "cs.AI"]   # 查询类别
-KEYWORDS = ["open vocabulary semantic segmentation", "open-vocabulary semantic segmentation"]  # 查询关键词
-DAYS = 20             # 最近几天的论文
-MAX_RESULTS = 100    # 每个类别最大返回论文数
-MAX_PAGES = 5         # 最多翻页次数，避免近期论文超过单页上限时漏抓
+CATEGORIES = ["cs.CV", "cs.CL", "cs.AI"]
+KEYWORDS = [
+    "open vocabulary semantic segmentation",
+    "open-vocabulary semantic segmentation",
+]
+DAYS = 1
+MAX_RESULTS = 100
 REQUEST_TIMEOUT = 30
-
-# Email Setting
-emailfile = f'MyEmail.yaml'
-EMAILPATH = CONFIGPATH + emailfile
-email_cfg = OmegaConf.load(EMAILPATH)
-SENDER_EMAIL = email_cfg.sender_email
-SENDER_PASS = email_cfg.sender_pass
-RECEIVER_EMAIL = email_cfg.receiver_email
+MIN_ARXIV_INTERVAL_SECONDS = 3.5
+USER_AGENT = "PaperFetch/1.0 contact: oymk66666@outlook.com"
 SMTP_HOST = "smtp.qq.com"
+SEND_EMPTY_REPORT = os.getenv("SEND_EMPTY_REPORT", "false").lower() == "true"
 
-# =====================================
+LAST_ARXIV_REQUEST_TS = 0.0
+LOGGER = logging.getLogger("paperfetch")
 
 
-# ---------- Tool Function ----------
-def normalize_keywords(keywords):
-    """确保关键词为字符串列表"""
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Fetch arXiv papers and send a daily digest.")
+    parser.add_argument("--days", type=int, default=DAYS, help="Recent days to query.")
+    parser.add_argument("--max-results", type=int, default=MAX_RESULTS, help="Maximum arXiv results to request.")
+    parser.add_argument("--dry-run", action="store_true", help="Run fully but do not send email.")
+    parser.add_argument("--no-email", action="store_true", help="Generate the report without sending email.")
+    parser.add_argument("--no-cache", action="store_true", help="Do not read or write the daily arXiv cache.")
+    parser.add_argument("--log-level", default="INFO", help="Python logging level.")
+    return parser.parse_args()
+
+
+def configure_logging(level_name: str) -> None:
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
+
+def normalize_keywords(keywords: list[str] | tuple[str, ...] | str) -> list[str]:
     if isinstance(keywords, str):
-        parts = re.split(r'\s*,\s*|\s+OR\s+|\s*\|\|\s*', keywords.strip(), flags=re.IGNORECASE)
+        parts = re.split(r"\s*,\s*|\s+OR\s+|\s*\|\|\s*", keywords.strip(), flags=re.IGNORECASE)
         return [p.strip() for p in parts if p.strip()]
-    elif isinstance(keywords, (list, tuple)):
+    if isinstance(keywords, (list, tuple)):
         return [str(k).strip() for k in keywords if str(k).strip()]
-    else:
-        raise ValueError("keywords must be a list or a string")
+    raise ValueError("keywords must be a list or a string")
 
 
-def make_arxiv_inner_clause(keywords):
-    """生成 arXiv 查询字符串"""
-    kws = normalize_keywords(keywords)
+def make_keyword_clause(keywords: list[str]) -> str:
     parts = []
-    for kw in kws:
-        kw_escaped = kw.replace('"', '\\"')
-        if " " in kw_escaped:
-            parts.append(f'all:"{kw_escaped}"')
+    for keyword in keywords:
+        escaped = keyword.replace('"', '\\"')
+        if " " in escaped or "-" in escaped:
+            parts.append(f'all:"{escaped}"')
         else:
-            parts.append(f"all:{kw_escaped}")
+            parts.append(f"all:{escaped}")
     return " OR ".join(parts)
 
 
-def build_arxiv_url(category, keywords, start=0, max_results=50):
-    """构造 arXiv API 查询 URL"""
-    inner = make_arxiv_inner_clause(keywords)
-    raw_query = f"cat:{category} AND ({inner})"
+def make_category_clause(categories: list[str]) -> str:
+    return " OR ".join(f"cat:{category}" for category in categories)
+
+
+def submitted_date_range(days: int) -> tuple[str, str]:
+    if days < 1:
+        raise ValueError("--days must be >= 1")
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=days - 1)).strftime("%Y%m%d0000")
+    end = now.strftime("%Y%m%d2359")
+    return start, end
+
+
+def build_arxiv_url(categories: list[str], keywords: list[str], days: int, max_results: int) -> tuple[str, str]:
+    if not categories:
+        raise ValueError("categories cannot be empty")
+    if not keywords:
+        raise ValueError("keywords cannot be empty")
+    if max_results < 1:
+        raise ValueError("--max-results must be >= 1")
+
+    max_results = min(max_results, 100)
+    start_date, end_date = submitted_date_range(days)
+    raw_query = (
+        f"({make_category_clause(categories)}) "
+        f"AND ({make_keyword_clause(keywords)}) "
+        f"AND submittedDate:[{start_date} TO {end_date}]"
+    )
     encoded_query = quote_plus(raw_query)
-    base_url = "https://export.arxiv.org/api/query?"
-    return (f"{base_url}search_query={encoded_query}"
-            f"&start={start}&max_results={max_results}"
-            f"&sortBy=submittedDate&sortOrder=descending")
+    url = (
+        "https://export.arxiv.org/api/query?"
+        f"search_query={encoded_query}"
+        f"&start=0&max_results={max_results}"
+        "&sortBy=submittedDate&sortOrder=descending"
+    )
+    return url, raw_query
 
 
-def fetch_feed_with_retry(url, max_retries=3, delay=2):
-    """带重试的 feedparser 请求；请求失败时不要伪装成空结果。"""
-    last_error = None
+def wait_for_arxiv_rate_limit() -> None:
+    global LAST_ARXIV_REQUEST_TS
+    now = time.monotonic()
+    elapsed = now - LAST_ARXIV_REQUEST_TS
+    if elapsed < MIN_ARXIV_INTERVAL_SECONDS:
+        sleep_for = MIN_ARXIV_INTERVAL_SECONDS - elapsed
+        LOGGER.info("arXiv rate limit sleep %.2fs", sleep_for)
+        time.sleep(sleep_for)
+    LAST_ARXIV_REQUEST_TS = time.monotonic()
+
+
+def retry_after_seconds(exc: HTTPError) -> float | None:
+    value = exc.headers.get("Retry-After") if exc.headers else None
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError):
+            return None
+
+
+def backoff_seconds(attempt: int, exc: Exception) -> float:
+    if isinstance(exc, HTTPError):
+        retry_after = retry_after_seconds(exc)
+        if retry_after is not None:
+            return min(retry_after, 300.0)
+    schedule = [30, 60, 120, 240, 300]
+    base = schedule[min(attempt, len(schedule) - 1)]
+    return base + random.uniform(0, 10)
+
+
+def rate_limited_fetch(url: str, max_retries: int = 5) -> bytes:
+    last_error: Exception | None = None
     for attempt in range(max_retries):
         try:
-            req = Request(
-                url,
-                headers={
-                    "User-Agent": "PaperFetch/1.0 (arXiv daily digest; contact: local-user)"
-                },
-            )
+            LOGGER.info("arXiv request attempt=%s max_retries=%s", attempt + 1, max_retries)
+            wait_for_arxiv_rate_limit()
+            req = Request(url, headers={"User-Agent": USER_AGENT})
             with urlopen(req, timeout=REQUEST_TIMEOUT) as response:
-                data = response.read()
-
-            feed = feedparser.parse(data)
-            if getattr(feed, "bozo", False):
-                last_error = getattr(feed, "bozo_exception", "feed parse error")
-                raise RuntimeError(f"arXiv feed parse failed: {last_error}")
-            return feed
-        except (HTTPError, URLError, TimeoutError, RuntimeError) as exc:
+                return response.read()
+        except (HTTPError, URLError, TimeoutError, socket.timeout) as exc:
             last_error = exc
-            if attempt < max_retries - 1:
-                time.sleep(delay * (attempt + 1))
+            if isinstance(exc, HTTPError) and exc.code == 429:
+                LOGGER.warning("HTTP 429 from arXiv")
+            elif isinstance(exc, (TimeoutError, socket.timeout)):
+                LOGGER.warning("timeout while requesting arXiv")
+            else:
+                LOGGER.warning("recoverable arXiv request failure: %r", exc)
 
+            if attempt >= max_retries - 1:
+                break
+            sleep_for = backoff_seconds(attempt, exc)
+            LOGGER.info("retry after %.2fs", sleep_for)
+            time.sleep(sleep_for)
     raise RuntimeError(f"Failed to fetch arXiv feed after {max_retries} retries: {last_error}")
 
 
-def keyword_in_text(text, kw):
-    """宽松关键词匹配"""
-    patt = r'(?<![A-Za-z0-9_])' + re.escape(kw.lower()) + r'(?![A-Za-z0-9_])'
-    return re.search(patt, text.lower()) is not None
+def parse_feed(data: bytes) -> Any:
+    import feedparser
+
+    feed = feedparser.parse(data)
+    if getattr(feed, "bozo", False):
+        raise RuntimeError(f"arXiv feed parse failed: {getattr(feed, 'bozo_exception', 'unknown error')}")
+    return feed
 
 
-def keyword_match(entry, keywords):
-    """标题/摘要匹配关键词"""
-    text = (entry.get("title", "") + " " + entry.get("summary", "")).lower()
-    return any(keyword_in_text(text, kw) for kw in keywords)
+def cache_path(raw_query: str) -> Path:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    query_hash = hashlib.sha256(raw_query.encode("utf-8")).hexdigest()[:12]
+    return CACHE_DIR / f"arxiv_{today}_{query_hash}.json"
 
 
-def entry_recent_time(entry):
-    """取论文 published/updated 中较新的时间，避免更新论文被 published 过滤掉。"""
+def load_cache(path: Path) -> list[dict[str, Any]] | None:
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as fp:
+        payload = json.load(fp)
+    LOGGER.info("loaded arXiv cache: %s", path)
+    return payload.get("papers", [])
+
+
+def write_cache(path: Path, raw_query: str, papers: list[dict[str, Any]]) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "query": raw_query,
+        "papers": papers,
+    }
+    with path.open("w", encoding="utf-8") as fp:
+        json.dump(payload, fp, ensure_ascii=False, indent=2)
+    LOGGER.info("wrote arXiv cache: %s", path)
+
+
+def keyword_in_text(text: str, keyword: str) -> bool:
+    pattern = r"(?<![A-Za-z0-9_])" + re.escape(keyword.lower()) + r"(?![A-Za-z0-9_])"
+    return re.search(pattern, text.lower()) is not None
+
+
+def keyword_match(entry: Any, keywords: list[str]) -> bool:
+    text = f"{entry.get('title', '')} {entry.get('summary', '')}"
+    return any(keyword_in_text(text, keyword) for keyword in keywords)
+
+
+def entry_recent_time(entry: Any) -> datetime | None:
     candidates = []
     for key in ("published", "updated"):
         value = entry.get(key)
@@ -125,91 +241,162 @@ def entry_recent_time(entry):
     return max(candidates) if candidates else None
 
 
-# ---------- 主爬取函数 ----------
-def fetch_arxiv_papers(keywords, categories, days=1, max_results=100, max_pages=MAX_PAGES):
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    papers, seen = [], set()
+def arxiv_id(entry: Any) -> str:
+    raw = entry.get("id") or entry.get("link") or ""
+    match = re.search(r"abs/([^v?#]+)(?:v\d+)?", raw)
+    if match:
+        return match.group(1)
+    return raw.rsplit("/", 1)[-1].split("v")[0] or raw
 
-    for cat in categories:
-        for page in range(max_pages):
-            start = page * max_results
-            url = build_arxiv_url(cat, keywords, start=start, max_results=max_results)
-            feed = fetch_feed_with_retry(url)
 
-            if not feed.entries:
-                break
+def entry_categories(entry: Any) -> str:
+    tags = entry.get("tags", [])
+    terms = [tag.get("term") for tag in tags if tag.get("term")]
+    return ", ".join(terms)
 
-            reached_old_entries = False
-            for e in feed.entries:
-                recent_time = entry_recent_time(e)
-                if recent_time is None:
-                    continue
 
-                if recent_time < cutoff:
-                    reached_old_entries = True
-                    continue
-                if not keyword_match(e, keywords):
-                    continue
+def entry_authors(entry: Any) -> str:
+    authors = entry.get("authors", [])
+    names = []
+    for author in authors:
+        if isinstance(author, dict):
+            names.append(author.get("name", ""))
+        else:
+            names.append(getattr(author, "name", ""))
+    return ", ".join(name for name in names if name)
 
-                title = e.get("title", "").strip().replace("\n", " ")
-                key = e.get("id") or e.get("link") or (title, recent_time.strftime("%Y-%m-%d"))
-                if key in seen:
-                    continue
-                seen.add(key)
 
-                papers.append({
-                    "title": title,
-                    "authors": ", ".join(a.name for a in e.get("authors", [])),
-                    "summary": re.sub(r"\s+", " ", e.get("summary", "").strip()),
-                    "published": recent_time.strftime("%Y-%m-%d"),
-                    "category": cat,
-                    "link": e.get("link", "")
-                })
-
-            if reached_old_entries:
-                break
-
-            time.sleep(3)
-
-    # Sorted by Dates
-    papers.sort(key=lambda x: x["published"], reverse=True)
+def papers_from_feed(feed: Any, keywords: list[str]) -> list[dict[str, Any]]:
+    papers_by_id: dict[str, dict[str, Any]] = {}
+    for entry in feed.entries:
+        if not keyword_match(entry, keywords):
+            continue
+        recent_time = entry_recent_time(entry)
+        if recent_time is None:
+            continue
+        paper_id = arxiv_id(entry)
+        title = entry.get("title", "").strip().replace("\n", " ")
+        papers_by_id[paper_id] = {
+            "arxiv_id": paper_id,
+            "title": title,
+            "authors": entry_authors(entry),
+            "summary": re.sub(r"\s+", " ", entry.get("summary", "").strip()),
+            "published": recent_time.strftime("%Y-%m-%d"),
+            "category": entry_categories(entry),
+            "link": entry.get("link", ""),
+        }
+    papers = list(papers_by_id.values())
+    papers.sort(key=lambda item: item["published"], reverse=True)
     return papers
 
 
-# ---------- Markdown Generation ----------
-def generate_markdown(papers):
+def fetch_arxiv_papers(
+    keywords: list[str],
+    categories: list[str],
+    days: int,
+    max_results: int,
+    no_cache: bool,
+) -> list[dict[str, Any]]:
+    url, raw_query = build_arxiv_url(categories, keywords, days, max_results)
+    path = cache_path(raw_query)
+    LOGGER.info("arXiv query: %s", raw_query)
+    LOGGER.info("arXiv query URL: %s", url[:300])
+
+    if not no_cache:
+        cached = load_cache(path)
+        if cached is not None:
+            return cached
+
+    try:
+        data = rate_limited_fetch(url)
+        feed = parse_feed(data)
+        papers = papers_from_feed(feed, keywords)
+        LOGGER.info("final matched paper count=%s", len(papers))
+        if not no_cache:
+            write_cache(path, raw_query, papers)
+        return papers
+    except Exception:
+        if not no_cache:
+            cached = load_cache(path)
+            if cached is not None:
+                LOGGER.warning("WARNING: arXiv fetch failed, fallback to cache")
+                return cached
+        raise
+
+
+def generate_markdown(papers: list[dict[str, Any]]) -> str:
     if not papers:
         return "### No new papers found today.\n"
 
-    md = ["# Daily arXiv Digest\n"]
-    for i, p in enumerate(papers, 1):
-        md.append(f"### {i}. [{p['title']}]({p['link']})")
-        md.append(f"- **Authors:** {p['authors']}")
-        md.append(f"- **Category:** `{p['category']}`")
-        md.append(f"- **Published:** {p['published']}\n")
-        md.append(f"{p['summary']}\n")
-    return "\n".join(md)
+    lines = ["# Daily arXiv Digest\n"]
+    for index, paper in enumerate(papers, 1):
+        lines.append(f"### {index}. [{paper['title']}]({paper['link']})")
+        lines.append(f"- **arXiv ID:** `{paper['arxiv_id']}`")
+        lines.append(f"- **Authors:** {paper['authors']}")
+        lines.append(f"- **Category:** `{paper['category']}`")
+        lines.append(f"- **Published:** {paper['published']}\n")
+        lines.append(f"{paper['summary']}\n")
+    return "\n".join(lines)
 
 
-# ---------- 邮件发送 ----------
-def send_email(subject, markdown_content):
-    yag = yagmail.SMTP(user=SENDER_EMAIL, password=SENDER_PASS, host=SMTP_HOST)
-    yag.send(
-        to=RECEIVER_EMAIL,
-        subject=subject,
-        contents=[markdown_content]
+def load_email_config() -> Any:
+    from omegaconf import OmegaConf
+
+    if not EMAIL_CONFIG.exists():
+        raise FileNotFoundError(f"email config not found: {EMAIL_CONFIG}")
+    cfg = OmegaConf.load(EMAIL_CONFIG)
+    required = ["sender_email", "sender_pass", "receiver_email"]
+    missing = [name for name in required if not getattr(cfg, name, None)]
+    if missing:
+        raise ValueError(f"email config missing required fields: {', '.join(missing)}")
+    return cfg
+
+
+def send_email(subject: str, markdown_content: str) -> None:
+    import yagmail
+
+    cfg = load_email_config()
+    yag = yagmail.SMTP(user=cfg.sender_email, password=cfg.sender_pass, host=SMTP_HOST)
+    yag.send(to=cfg.receiver_email, subject=subject, contents=[markdown_content])
+    LOGGER.info("email sent to %s", cfg.receiver_email)
+
+
+def main() -> int:
+    args = parse_args()
+    configure_logging(args.log_level)
+
+    keywords = normalize_keywords(KEYWORDS)
+    categories = [category.strip() for category in CATEGORIES if category.strip()]
+    LOGGER.info("starting PaperFetch days=%s max_results=%s", args.days, min(args.max_results, 100))
+
+    papers = fetch_arxiv_papers(
+        keywords=keywords,
+        categories=categories,
+        days=args.days,
+        max_results=args.max_results,
+        no_cache=args.no_cache,
     )
-    print(f"邮件已发送至 {RECEIVER_EMAIL}")
+    LOGGER.info("final paper count=%s", len(papers))
 
+    if not papers:
+        LOGGER.info("No matched papers found.")
+        if not SEND_EMPTY_REPORT:
+            LOGGER.info("No matched papers today, skip email.")
+            return 0
 
-# ---------- 主程序 ----------
-if __name__ == "__main__":
-    print("正在从 arXiv 获取最新论文...")
-
-    papers = fetch_arxiv_papers(KEYWORDS, CATEGORIES, days=DAYS, max_results=MAX_RESULTS)
-    print(f"共获取到 {len(papers)} 篇符合条件的论文")
-
-    md_report = generate_markdown(papers)
+    report = generate_markdown(papers)
     subject = f"arXiv Daily Digest - {datetime.now().strftime('%Y-%m-%d')}"
+    should_send_email = not args.dry_run and not args.no_email
+    LOGGER.info("send_email=%s dry_run=%s no_email=%s", should_send_email, args.dry_run, args.no_email)
 
-    send_email(subject, md_report)
+    if should_send_email:
+        send_email(subject, report)
+    else:
+        LOGGER.info("email not sent")
+        LOGGER.debug("generated report:\n%s", report)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

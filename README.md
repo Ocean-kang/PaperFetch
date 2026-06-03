@@ -36,6 +36,7 @@ Runtime directories are expected by the scripts but are not tracked by Git:
 config/
 savefile/
 log/
+cache/
 ```
 
 ## Requirements
@@ -77,7 +78,7 @@ pip install -r requirements.txt
 Create runtime directories:
 
 ```bash
-mkdir -p config savefile log
+mkdir -p config savefile log cache
 ```
 
 ## Data Preparation
@@ -102,10 +103,10 @@ For a simple CSV export:
 python PaperFetch.py
 ```
 
-For the keyword-focused daily email digest:
+For the keyword-focused daily digest without sending email:
 
 ```bash
-python PaperFrech_daily_keyword.py
+python PaperFrech_daily_keyword.py --dry-run --no-email --days 1 --max-results 20
 ```
 
 For server deployment through the provided shell script:
@@ -135,7 +136,7 @@ Edit the constants at the top of `PaperFrech_daily_keyword.py`:
 ```python
 CATEGORIES = ["cs.CV", "cs.CL", "cs.AI"]
 KEYWORDS = ["open vocabulary semantic segmentation", "open-vocabulary semantic segmentation"]
-DAYS = 20
+DAYS = 1
 MAX_RESULTS = 100
 ```
 
@@ -168,10 +169,20 @@ bash run.sh
 Example cron entry:
 
 ```bash
-0 8 * * * /bin/bash /root/code/PaperFetch/run.sh
+0 9 * * * /bin/bash -lc '/root/code/PaperFetch/run.sh' >> /root/code/PaperFetch/cron.log 2>&1
 ```
 
-TODO: Adjust the cron time and server paths according to your deployment environment.
+Do not keep a test schedule such as `* * * * *` for PaperFetch in production. The `run.sh`
+wrapper also uses `flock` so an accidental high-frequency cron entry will not run concurrent
+jobs.
+
+Useful deployment checks:
+
+```bash
+crontab -l
+tail -100 /root/code/PaperFetch/cron.log
+tail -200 /root/code/PaperFetch/log/run.log
+```
 
 ## Entry Scripts
 
@@ -179,16 +190,27 @@ TODO: Adjust the cron time and server paths according to your deployment environ
 | ------ | ------- | ------ |
 | `PaperFetch.py` | Fetch recent arXiv papers for a single query/category setting | CSV file under `savefile/` |
 | `PaperFetch_daily.py` | Fetch recent papers from multiple categories, generate Markdown, and optionally send email | Markdown file under `savefile/`; email if enabled |
-| `PaperFrech_daily_keyword.py` | Fetch papers using multiple keywords/categories and send a Markdown digest by email | Email digest |
+| `PaperFrech_daily_keyword.py` | Fetch papers using one combined query, deduplicate, and send at most one Markdown digest email | Email digest |
 | `run.sh` | Server wrapper for scheduled execution of `PaperFrech_daily_keyword.py` | Log file under `log/run.log` |
 
 ## Command Line Arguments
 
-The current scripts do not define command-line arguments. Configuration is done by editing constants in the Python files and by providing `config/MyEmail.yaml`.
+`PaperFrech_daily_keyword.py` supports command-line arguments for safe testing and production runs.
 
 | Argument | Type | Default | Description |
 | -------- | ---: | ------: | ----------- |
-| TODO | TODO | TODO | Add CLI arguments if the project is refactored to use `argparse` or another CLI framework. |
+| `--days` | int | `1` | Recent UTC days to query through `submittedDate`. |
+| `--max-results` | int | `100` | Maximum arXiv results to request. Values above 100 are capped at 100. |
+| `--dry-run` | flag | off | Fetch, filter, and generate the report, but do not send email. |
+| `--no-email` | flag | off | Disable email sending for this run. |
+| `--no-cache` | flag | off | Skip reading and writing the daily arXiv cache. |
+| `--log-level` | str | `INFO` | Python logging level, such as `INFO` or `DEBUG`. |
+
+Safe manual test:
+
+```bash
+python PaperFrech_daily_keyword.py --dry-run --no-email --days 1 --max-results 20
+```
 
 ## Configuration
 
@@ -215,9 +237,8 @@ In `PaperFrech_daily_keyword.py`:
 ```python
 CATEGORIES = ["cs.CV", "cs.CL", "cs.AI"]
 KEYWORDS = ["open vocabulary semantic segmentation", "open-vocabulary semantic segmentation"]
-DAYS = 20
+DAYS = 1
 MAX_RESULTS = 100
-MAX_PAGES = 5
 REQUEST_TIMEOUT = 30
 SMTP_HOST = "smtp.qq.com"
 ```
@@ -229,8 +250,7 @@ Meaning:
 | `CATEGORIES` | list | arXiv categories to query |
 | `KEYWORDS` | list | Keywords or phrases to match in title/abstract |
 | `DAYS` | int | Number of recent days to keep |
-| `MAX_RESULTS` | int | Maximum number of arXiv results per page/category |
-| `MAX_PAGES` | int | Maximum number of pages fetched per category |
+| `MAX_RESULTS` | int | Maximum number of arXiv results requested for the combined query |
 | `REQUEST_TIMEOUT` | int | HTTP request timeout in seconds |
 | `SMTP_HOST` | str | SMTP server host |
 
@@ -245,14 +265,18 @@ savefile/
 
 log/
 `-- run.log
+
+cache/
+`-- arxiv_<YYYY-MM-DD>_<query-hash>.json
 ```
 
 Output details:
 
 * `PaperFetch.py` writes CSV files to `savefile/`.
 * `PaperFetch_daily.py` writes Markdown reports to `savefile/`.
-* `PaperFrech_daily_keyword.py` sends the Markdown digest by email.
+* `PaperFrech_daily_keyword.py` sends the Markdown digest by email unless `--dry-run` or `--no-email` is used.
 * `run.sh` appends runtime logs to `log/run.log`.
+* `cron.log` should only show whether cron invoked `run.sh`; the main execution detail is in `log/run.log`.
 
 ## Reproduce Results
 
@@ -277,6 +301,37 @@ Or run the server wrapper:
 
 ```bash
 bash run.sh
+```
+
+## Production Verification
+
+Check cron is not running a per-minute PaperFetch test job:
+
+```bash
+crontab -l
+```
+
+Run a no-email test:
+
+```bash
+cd /root/code/PaperFetch
+/root/miniconda3/envs/paperfetch/bin/python PaperFrech_daily_keyword.py --dry-run --no-email --days 1 --max-results 20
+echo $?
+```
+
+Run the wrapper manually:
+
+```bash
+cd /root/code/PaperFetch
+/bin/bash /root/code/PaperFetch/run.sh
+echo $?
+tail -200 /root/code/PaperFetch/log/run.log
+```
+
+Run two wrapper processes at the same time to verify locking. The second process should log:
+
+```text
+Another PaperFetch job is running, skip.
 ```
 
 ## Examples
