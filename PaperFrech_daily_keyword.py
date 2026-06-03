@@ -8,7 +8,6 @@ import argparse
 import hashlib
 import json
 import logging
-import os
 import random
 import re
 import socket
@@ -27,16 +26,50 @@ EMAIL_CONFIG = CONFIG_DIR / "MyEmail.yaml"
 
 CATEGORIES = ["cs.CV", "cs.CL", "cs.AI"]
 KEYWORDS = [
+    # open-vocabulary segmentation
     "open vocabulary semantic segmentation",
     "open-vocabulary semantic segmentation",
+    "open vocabulary segmentation",
+    "open-vocabulary segmentation",
+
+    # vision-language / multimodal alignment
+    "vision-language alignment",
+    "vision language alignment",
+    "image-text alignment",
+    "image text alignment",
+    "cross-modal alignment",
+    "cross modal alignment",
+    "multimodal alignment",
+    "multi-modal alignment",
+
+    # unsupervised / unpaired alignment
+    "unsupervised alignment",
+    "unsupervised embedding alignment",
+    "unsupervised representation alignment",
+    "unsupervised cross-modal alignment",
+    "unpaired alignment",
+    "unpaired image-text alignment",
+    "unpaired vision-language alignment",
+    "unpaired multimodal alignment",
+
+    # distribution / geometry / translator
+    "distribution matching",
+    "embedding distribution alignment",
+    "embedding translation",
+    "embedding translator",
+    "vector space alignment",
+    "representation alignment",
+    "manifold alignment",
+    "optimal transport alignment",
+    "adversarial alignment",
 ]
-DAYS = 1
+DAYS = 20
 MAX_RESULTS = 100
 REQUEST_TIMEOUT = 30
 MIN_ARXIV_INTERVAL_SECONDS = 3.5
 USER_AGENT = "PaperFetch/1.0 contact: oymk66666@outlook.com"
 SMTP_HOST = "smtp.qq.com"
-SEND_EMPTY_REPORT = os.getenv("SEND_EMPTY_REPORT", "false").lower() == "true"
+SMTP_PORT = 465
 
 LAST_ARXIV_REQUEST_TS = 0.0
 LOGGER = logging.getLogger("paperfetch")
@@ -312,8 +345,10 @@ def fetch_arxiv_papers(
         feed = parse_feed(data)
         papers = papers_from_feed(feed, keywords)
         LOGGER.info("final matched paper count=%s", len(papers))
-        if not no_cache:
+        if not no_cache and papers:
             write_cache(path, raw_query, papers)
+        elif not no_cache:
+            LOGGER.info("skip writing empty arXiv cache")
         return papers
     except Exception:
         if not no_cache:
@@ -324,9 +359,34 @@ def fetch_arxiv_papers(
         raise
 
 
-def generate_markdown(papers: list[dict[str, Any]]) -> str:
+def build_email_subject(papers: list[dict[str, Any]], days: int) -> str:
+    if papers:
+        return f"PaperFetch: 最近 {days} 天找到 {len(papers)} 篇相关论文"
+    return f"PaperFetch: 最近 {days} 天未找到匹配论文"
+
+
+def build_empty_report(keywords: list[str], categories: list[str], days: int) -> str:
+    run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return "\n".join(
+        [
+            "# PaperFetch 检索结果",
+            "",
+            "本次没有找到符合条件的论文。",
+            "",
+            f"- 检索范围：最近 {days} 天",
+            f"- arXiv categories: {', '.join(categories)}",
+            f"- 当前关键词：{', '.join(keywords)}",
+            "- 匹配论文数量：0",
+            f"- 运行时间：{run_time}",
+            "",
+            "这表示程序运行成功，但本次查询没有匹配结果；这不是程序错误。",
+        ]
+    )
+
+
+def generate_markdown(papers: list[dict[str, Any]], keywords: list[str], categories: list[str], days: int) -> str:
     if not papers:
-        return "### No new papers found today.\n"
+        return build_empty_report(keywords, categories, days)
 
     lines = ["# Daily arXiv Digest\n"]
     for index, paper in enumerate(papers, 1):
@@ -356,7 +416,13 @@ def send_email(subject: str, markdown_content: str) -> None:
     import yagmail
 
     cfg = load_email_config()
-    yag = yagmail.SMTP(user=cfg.sender_email, password=cfg.sender_pass, host=SMTP_HOST)
+    yag = yagmail.SMTP(
+        user=cfg.sender_email,
+        password=cfg.sender_pass,
+        host=SMTP_HOST,
+        port=SMTP_PORT,
+        smtp_ssl=True,
+    )
     yag.send(to=cfg.receiver_email, subject=subject, contents=[markdown_content])
     LOGGER.info("email sent to %s", cfg.receiver_email)
 
@@ -379,13 +445,10 @@ def main() -> int:
     LOGGER.info("final paper count=%s", len(papers))
 
     if not papers:
-        LOGGER.info("No matched papers found.")
-        if not SEND_EMPTY_REPORT:
-            LOGGER.info("No matched papers today, skip email.")
-            return 0
+        LOGGER.info("No matched papers found, sending empty report email.")
 
-    report = generate_markdown(papers)
-    subject = f"arXiv Daily Digest - {datetime.now().strftime('%Y-%m-%d')}"
+    report = generate_markdown(papers, keywords, categories, args.days)
+    subject = build_email_subject(papers, args.days)
     should_send_email = not args.dry_run and not args.no_email
     LOGGER.info("send_email=%s dry_run=%s no_email=%s", should_send_email, args.dry_run, args.no_email)
 

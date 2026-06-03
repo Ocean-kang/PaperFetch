@@ -106,7 +106,7 @@ python PaperFetch.py
 For the keyword-focused daily digest without sending email:
 
 ```bash
-python PaperFrech_daily_keyword.py --dry-run --no-email --days 1 --max-results 20
+python PaperFrech_daily_keyword.py --dry-run --no-email --days 20 --max-results 20
 ```
 
 For server deployment through the provided shell script:
@@ -135,8 +135,16 @@ Edit the constants at the top of `PaperFrech_daily_keyword.py`:
 
 ```python
 CATEGORIES = ["cs.CV", "cs.CL", "cs.AI"]
-KEYWORDS = ["open vocabulary semantic segmentation", "open-vocabulary semantic segmentation"]
-DAYS = 1
+KEYWORDS = [
+    "open vocabulary semantic segmentation",
+    "open-vocabulary semantic segmentation",
+    "vision-language alignment",
+    "unsupervised embedding alignment",
+    "unpaired image-text alignment",
+    "distribution matching",
+    "optimal transport alignment",
+]
+DAYS = 20
 MAX_RESULTS = 100
 ```
 
@@ -199,7 +207,7 @@ tail -200 /root/code/PaperFetch/log/run.log
 
 | Argument | Type | Default | Description |
 | -------- | ---: | ------: | ----------- |
-| `--days` | int | `1` | Recent UTC days to query through `submittedDate`. |
+| `--days` | int | `20` | Recent UTC days to query through `submittedDate`. |
 | `--max-results` | int | `100` | Maximum arXiv results to request. Values above 100 are capped at 100. |
 | `--dry-run` | flag | off | Fetch, filter, and generate the report, but do not send email. |
 | `--no-email` | flag | off | Disable email sending for this run. |
@@ -209,7 +217,7 @@ tail -200 /root/code/PaperFetch/log/run.log
 Safe manual test:
 
 ```bash
-python PaperFrech_daily_keyword.py --dry-run --no-email --days 1 --max-results 20
+python PaperFrech_daily_keyword.py --dry-run --no-email --days 20 --max-results 20
 ```
 
 ## Configuration
@@ -236,8 +244,26 @@ In `PaperFrech_daily_keyword.py`:
 
 ```python
 CATEGORIES = ["cs.CV", "cs.CL", "cs.AI"]
-KEYWORDS = ["open vocabulary semantic segmentation", "open-vocabulary semantic segmentation"]
-DAYS = 1
+KEYWORDS = [
+    "open vocabulary semantic segmentation",
+    "open-vocabulary semantic segmentation",
+    "open vocabulary segmentation",
+    "open-vocabulary segmentation",
+    "vision-language alignment",
+    "image-text alignment",
+    "cross-modal alignment",
+    "multimodal alignment",
+    "unsupervised alignment",
+    "unsupervised embedding alignment",
+    "unpaired image-text alignment",
+    "distribution matching",
+    "embedding translator",
+    "vector space alignment",
+    "manifold alignment",
+    "optimal transport alignment",
+    "adversarial alignment",
+]
+DAYS = 20
 MAX_RESULTS = 100
 REQUEST_TIMEOUT = 30
 SMTP_HOST = "smtp.qq.com"
@@ -248,7 +274,7 @@ Meaning:
 | Name | Type | Description |
 | ---- | ---- | ----------- |
 | `CATEGORIES` | list | arXiv categories to query |
-| `KEYWORDS` | list | Keywords or phrases to match in title/abstract |
+| `KEYWORDS` | list | Keywords or phrases to match in title/abstract. The default list uses OR matching across open-vocabulary segmentation, vision-language alignment, unsupervised/unpaired alignment, distribution matching, and related vector-space alignment topics. |
 | `DAYS` | int | Number of recent days to keep |
 | `MAX_RESULTS` | int | Maximum number of arXiv results requested for the combined query |
 | `REQUEST_TIMEOUT` | int | HTTP request timeout in seconds |
@@ -315,7 +341,7 @@ Run a no-email test:
 
 ```bash
 cd /root/code/PaperFetch
-/root/miniconda3/envs/paperfetch/bin/python PaperFrech_daily_keyword.py --dry-run --no-email --days 1 --max-results 20
+/root/miniconda3/envs/paperfetch/bin/python PaperFrech_daily_keyword.py --dry-run --no-email --days 20 --max-results 20
 echo $?
 ```
 
@@ -416,6 +442,10 @@ Possible reasons:
 * Network connection from the server to arXiv was unstable.
 * Keywords are too strict and do not match title/abstract text.
 * The selected categories do not contain matching papers in the configured time window.
+
+An empty match result is still a successful run. The script sends a concise "no matched papers"
+email that includes the search window, keywords, categories, run time, and a note that the program
+did not fail.
 
 Check the log:
 
