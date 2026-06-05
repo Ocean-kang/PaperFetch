@@ -66,15 +66,26 @@ KEYWORDS = [
 DAYS = 20
 MAX_RESULTS = 100
 REQUEST_TIMEOUT = 30
-MIN_ARXIV_INTERVAL_SECONDS = 3.5
-KEYWORD_BATCH_SIZE = 5
-BATCH_SLEEP_SECONDS = 10
+MIN_ARXIV_INTERVAL_SECONDS = 10.0
+KEYWORD_BATCH_SIZE = 30
+BATCH_SLEEP_SECONDS = 120
+MAX_ARXIV_RETRIES = 3
+MAX_ARXIV_429_RETRIES = 1
+MAX_BACKOFF_SECONDS = 300.0
 USER_AGENT = "PaperFetch/1.0 contact: oymk66666@outlook.com"
 SMTP_HOST = "smtp.qq.com"
 SMTP_PORT = 465
 
 LAST_ARXIV_REQUEST_TS = 0.0
 LOGGER = logging.getLogger("paperfetch")
+
+
+class ArxivFetchError(RuntimeError):
+    """Base exception for arXiv fetch failures."""
+
+
+class ArxivRateLimitError(ArxivFetchError):
+    """Raised when arXiv returns HTTP 429 rate limit."""
 
 
 def parse_args() -> argparse.Namespace:
@@ -191,14 +202,15 @@ def backoff_seconds(attempt: int, exc: Exception) -> float:
     if isinstance(exc, HTTPError):
         retry_after = retry_after_seconds(exc)
         if retry_after is not None:
-            return min(retry_after, 300.0)
-    schedule = [30, 60, 120, 240, 300]
+            return min(retry_after, MAX_BACKOFF_SECONDS)
+    schedule = [30, 60, 120]
     base = schedule[min(attempt, len(schedule) - 1)]
-    return base + random.uniform(0, 10)
+    return min(base + random.uniform(0, 10), MAX_BACKOFF_SECONDS)
 
 
-def rate_limited_fetch(url: str, max_retries: int = 5) -> bytes:
+def rate_limited_fetch(url: str, max_retries: int = MAX_ARXIV_RETRIES) -> bytes:
     last_error: Exception | None = None
+    rate_limit_count = 0
     for attempt in range(max_retries):
         try:
             LOGGER.info("arXiv request attempt=%s max_retries=%s", attempt + 1, max_retries)
@@ -206,21 +218,50 @@ def rate_limited_fetch(url: str, max_retries: int = 5) -> bytes:
             req = Request(url, headers={"User-Agent": USER_AGENT})
             with urlopen(req, timeout=REQUEST_TIMEOUT) as response:
                 return response.read()
-        except (HTTPError, URLError, TimeoutError, socket.timeout) as exc:
+        except HTTPError as exc:
             last_error = exc
-            if isinstance(exc, HTTPError) and exc.code == 429:
-                LOGGER.warning("HTTP 429 from arXiv")
-            elif isinstance(exc, (TimeoutError, socket.timeout)):
+
+            if exc.code == 429:
+                rate_limit_count += 1
+                LOGGER.warning("HTTP 429 from arXiv; this run will stop if rate limit persists")
+                LOGGER.warning(
+                    "HTTP 429 from arXiv rate_limit_count=%s max_429_retries=%s",
+                    rate_limit_count,
+                    MAX_ARXIV_429_RETRIES,
+                )
+
+                if rate_limit_count > MAX_ARXIV_429_RETRIES or attempt >= max_retries - 1:
+                    raise ArxivRateLimitError(
+                        "arXiv returned HTTP 429 Too Many Requests. "
+                        "Stop this run to avoid worsening the rate limit. "
+                        "Try again later or reduce query frequency."
+                    ) from exc
+
+                sleep_for = backoff_seconds(attempt, exc)
+                LOGGER.info("rate limited by arXiv; retry after %.2fs", sleep_for)
+                time.sleep(sleep_for)
+                continue
+
+            LOGGER.warning("recoverable arXiv HTTP failure: %r", exc)
+
+        except (URLError, TimeoutError, socket.timeout) as exc:
+            last_error = exc
+            if isinstance(exc, (TimeoutError, socket.timeout)):
                 LOGGER.warning("timeout while requesting arXiv")
             else:
                 LOGGER.warning("recoverable arXiv request failure: %r", exc)
 
             if attempt >= max_retries - 1:
                 break
-            sleep_for = backoff_seconds(attempt, exc)
-            LOGGER.info("retry after %.2fs", sleep_for)
-            time.sleep(sleep_for)
-    raise RuntimeError(f"Failed to fetch arXiv feed after {max_retries} retries: {last_error}")
+
+        if attempt >= max_retries - 1:
+            break
+
+        sleep_for = backoff_seconds(attempt, last_error)
+        LOGGER.info("retry after %.2fs", sleep_for)
+        time.sleep(sleep_for)
+
+    raise ArxivFetchError(f"Failed to fetch arXiv feed after {max_retries} retries: {last_error}") from last_error
 
 
 def parse_feed(data: bytes) -> Any:
@@ -343,6 +384,12 @@ def fetch_arxiv_papers(
     no_cache: bool,
 ) -> list[dict[str, Any]]:
     batches = chunked(keywords, KEYWORD_BATCH_SIZE)
+    LOGGER.info(
+        "arXiv keyword batching: keyword_count=%s batch_size=%s batch_count=%s",
+        len(keywords),
+        KEYWORD_BATCH_SIZE,
+        len(batches),
+    )
     papers_by_id: dict[str, dict[str, Any]] = {}
     failures: list[str] = []
     successful_batches = 0
@@ -375,6 +422,13 @@ def fetch_arxiv_papers(
                 write_cache(path, raw_query, batch_papers)
             elif not no_cache:
                 LOGGER.info("No papers found for batch %s, skip writing empty cache.", index)
+        except ArxivRateLimitError:
+            LOGGER.exception(
+                "arXiv rate limited at keyword batch %s/%s; stop remaining batches",
+                index,
+                len(batches),
+            )
+            raise
         except Exception as exc:
             message = f"batch {index}/{len(batches)} failed: {exc!r}"
             failures.append(message)
