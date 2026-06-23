@@ -218,6 +218,8 @@ tail -200 /root/code/PaperFetch/log/run.log
 | `--dry-run` | flag | off | Fetch, filter, and generate the report, but do not send email. |
 | `--no-email` | flag | off | Disable email sending for this run. |
 | `--no-cache` | flag | off | Skip reading and writing the daily arXiv cache. |
+| `--no-cache-fallback` | flag | off | Disable the latest-cache digest fallback when arXiv fails. |
+| `--cache-fallback-max-age-days` | int | `7` | Maximum age for cached digest fallback results. |
 | `--log-level` | str | `INFO` | Python logging level, such as `INFO` or `DEBUG`. |
 
 Safe manual test:
@@ -299,7 +301,8 @@ log/
 `-- run.log
 
 cache/
-`-- arxiv_<YYYY-MM-DD>_<query-hash>.json
+|-- arxiv_<YYYY-MM-DD>_<query-hash>.json
+`-- arxiv_latest_<query-hash>.json
 ```
 
 Output details:
@@ -307,6 +310,7 @@ Output details:
 * `PaperFetch.py` writes CSV files to `savefile/`.
 * `PaperFetch_daily.py` writes Markdown reports to `savefile/`.
 * `PaperFrech_daily_keyword.py` sends the Markdown digest by email unless `--dry-run` or `--no-email` is used.
+* `PaperFrech_daily_keyword.py` writes a latest successful digest cache under `cache/` and can use it as a fallback if arXiv fails later.
 * `run.sh` appends runtime logs to `log/run.log`.
 * `cron.log` should only show whether cron invoked `run.sh`; the main execution detail is in `log/run.log`.
 
@@ -459,7 +463,26 @@ Check the log:
 tail -n 100 log/run.log
 ```
 
-### 5. `run.sh` Path Does Not Exist
+### 5. `PaperFetch Run Failed` Emails
+
+The keyword digest sends a failure email when every arXiv keyword batch fails or when arXiv returns a persistent HTTP 429 rate-limit response. Common causes are arXiv rate limiting, temporary network timeouts, or server connectivity trouble.
+
+If a recent successful digest cache exists, PaperFetch sends a cached digest instead of a full failure email. The subject includes `using cached results`, and the body lists the cache `created_at` time. This means the current arXiv request failed; the papers in that email came from the latest successful cached run, not from a fresh arXiv response that day.
+
+Useful checks:
+
+```bash
+tail -200 /root/code/PaperFetch/log/run.log
+crontab -l
+```
+
+To disable cached fallback and return to failure-only notifications:
+
+```bash
+python PaperFrech_daily_keyword.py --no-cache-fallback
+```
+
+### 6. `run.sh` Path Does Not Exist
 
 The script currently uses absolute server paths:
 

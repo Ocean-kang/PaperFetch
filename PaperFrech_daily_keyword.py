@@ -72,6 +72,7 @@ BATCH_SLEEP_SECONDS = 120
 MAX_ARXIV_RETRIES = 3
 MAX_ARXIV_429_RETRIES = 1
 MAX_BACKOFF_SECONDS = 300.0
+CACHE_FALLBACK_MAX_AGE_DAYS = 7
 USER_AGENT = "PaperFetch/1.0 contact: oymk66666@outlook.com"
 SMTP_HOST = "smtp.qq.com"
 SMTP_PORT = 465
@@ -95,6 +96,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Run fully but do not send email.")
     parser.add_argument("--no-email", action="store_true", help="Generate the report without sending email.")
     parser.add_argument("--no-cache", action="store_true", help="Do not read or write the daily arXiv cache.")
+    parser.add_argument("--no-cache-fallback", action="store_true", help="Do not send a cached digest if arXiv fails.")
+    parser.add_argument(
+        "--cache-fallback-max-age-days",
+        type=int,
+        default=CACHE_FALLBACK_MAX_AGE_DAYS,
+        help="Maximum age in days for the latest successful digest cache.",
+    )
     parser.add_argument("--log-level", default="INFO", help="Python logging level.")
     return parser.parse_args()
 
@@ -279,6 +287,28 @@ def cache_path(raw_query: str) -> Path:
     return CACHE_DIR / f"arxiv_{today}_{query_hash}.json"
 
 
+def latest_cache_path(keywords: list[str], categories: list[str], days: int, max_results: int) -> Path:
+    signature = {
+        "categories": categories,
+        "keywords": keywords,
+        "days": days,
+        "max_results": min(max_results, 100),
+    }
+    encoded = json.dumps(signature, ensure_ascii=False, sort_keys=True)
+    query_hash = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:12]
+    return CACHE_DIR / f"arxiv_latest_{query_hash}.json"
+
+
+def parse_cache_datetime(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def load_cache(path: Path) -> list[dict[str, Any]] | None:
     if not path.exists():
         return None
@@ -292,6 +322,50 @@ def load_cache(path: Path) -> list[dict[str, Any]] | None:
     return papers
 
 
+def load_latest_cache(
+    keywords: list[str],
+    categories: list[str],
+    days: int,
+    max_results: int,
+    max_age_days: int,
+) -> dict[str, Any] | None:
+    if max_age_days < 1:
+        LOGGER.info("latest cache fallback disabled by max_age_days=%s", max_age_days)
+        return None
+
+    path = latest_cache_path(keywords, categories, days, max_results)
+    if not path.exists():
+        LOGGER.info("no latest arXiv cache found: %s", path)
+        return None
+
+    with path.open("r", encoding="utf-8") as fp:
+        payload = json.load(fp)
+
+    papers = payload.get("papers")
+    if not isinstance(papers, list):
+        LOGGER.info("ignoring latest arXiv cache without a paper list: %s", path)
+        return None
+
+    created_at = parse_cache_datetime(payload.get("created_at", ""))
+    if created_at is None:
+        LOGGER.warning("ignoring latest arXiv cache with invalid created_at: %s", path)
+        return None
+
+    age = datetime.now(timezone.utc) - created_at
+    if age > timedelta(days=max_age_days):
+        LOGGER.warning(
+            "latest arXiv cache is too old: path=%s age_days=%.2f max_age_days=%s",
+            path,
+            age.total_seconds() / 86400,
+            max_age_days,
+        )
+        return None
+
+    LOGGER.info("loaded latest arXiv cache: %s created_at=%s", path, created_at.isoformat())
+    payload["path"] = str(path)
+    return payload
+
+
 def write_cache(path: Path, raw_query: str, papers: list[dict[str, Any]]) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -302,6 +376,30 @@ def write_cache(path: Path, raw_query: str, papers: list[dict[str, Any]]) -> Non
     with path.open("w", encoding="utf-8") as fp:
         json.dump(payload, fp, ensure_ascii=False, indent=2)
     LOGGER.info("wrote arXiv cache: %s", path)
+
+
+def write_latest_cache(
+    keywords: list[str],
+    categories: list[str],
+    days: int,
+    max_results: int,
+    papers: list[dict[str, Any]],
+) -> None:
+    path = latest_cache_path(keywords, categories, days, max_results)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "query": {
+            "categories": categories,
+            "keywords": keywords,
+            "days": days,
+            "max_results": min(max_results, 100),
+        },
+        "papers": papers,
+    }
+    with path.open("w", encoding="utf-8") as fp:
+        json.dump(payload, fp, ensure_ascii=False, indent=2)
+    LOGGER.info("wrote latest arXiv cache: %s", path)
 
 
 def keyword_in_text(text: str, keyword: str) -> bool:
@@ -453,29 +551,33 @@ def fetch_arxiv_papers(
 
 def build_email_subject(papers: list[dict[str, Any]], days: int) -> str:
     if papers:
-        return f"PaperFetch: 最近 {days} 天找到 {len(papers)} 篇相关论文"
-    return f"PaperFetch: 最近 {days} 天未找到匹配论文"
+        return f"PaperFetch: found {len(papers)} related paper(s) in the last {days} days"
+    return f"PaperFetch: no matching papers in the last {days} days"
 
 
 def build_failure_subject(days: int) -> str:
-    return f"PaperFetch: arXiv 请求失败（最近 {days} 天）"
+    return f"PaperFetch: arXiv request failed (last {days} days)"
+
+
+def build_cache_fallback_subject(days: int) -> str:
+    return f"PaperFetch: arXiv request failed, using cached results (last {days} days)"
 
 
 def build_empty_report(keywords: list[str], categories: list[str], days: int) -> str:
     run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return "\n".join(
         [
-            "# PaperFetch 检索结果",
+            "# PaperFetch Search Result",
             "",
-            "本次没有找到符合条件的论文。",
+            "No matching papers were found in this run.",
             "",
-            f"- 检索范围：最近 {days} 天",
+            f"- Search window: last {days} days",
             f"- arXiv categories: {', '.join(categories)}",
-            f"- 当前关键词：{', '.join(keywords)}",
-            "- 匹配论文数量：0",
-            f"- 运行时间：{run_time}",
+            f"- Keywords: {', '.join(keywords)}",
+            "- Matched paper count: 0",
+            f"- Run time: {run_time}",
             "",
-            "这表示程序运行成功，但本次查询没有匹配结果；这不是程序错误。",
+            "The program ran successfully. This is an empty match result, not a failure.",
         ]
     )
 
@@ -486,8 +588,17 @@ def build_failure_report(
     categories: list[str],
     days: int,
     max_results: int,
+    cache_checked: bool = False,
+    cache_hit: bool = False,
+    cache_created_at: str | None = None,
 ) -> str:
     run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cause = "arXiv API rate limiting (HTTP 429) is the most likely cause." if isinstance(error, ArxivRateLimitError) else "Likely causes include arXiv API rate limiting, network timeout, or temporary connectivity trouble."
+    cache_status = "not checked"
+    if cache_checked:
+        cache_status = "hit" if cache_hit else "miss"
+        if cache_created_at:
+            cache_status += f" (created_at: {cache_created_at})"
     return "\n".join(
         [
             "# PaperFetch Run Failed",
@@ -500,11 +611,61 @@ def build_failure_report(
             f"- max_results: {min(max_results, 100)}",
             f"- arXiv categories: {', '.join(categories)}",
             f"- Keyword count: {len(keywords)}",
+            f"- Cache fallback: {cache_status}",
             f"- Run time: {run_time}",
             "",
-            "This is usually caused by arXiv API rate limiting, a network timeout, or temporary connectivity trouble. It is not an email configuration error if you received this message.",
+            cause,
+            "",
+            "Check log/run.log and confirm cron is not running PaperFetch too frequently. It is not an email configuration error if you received this message.",
         ]
     )
+
+
+def build_cache_fallback_report(
+    error: Exception,
+    cached_payload: dict[str, Any],
+    keywords: list[str],
+    categories: list[str],
+    days: int,
+) -> str:
+    cached_created_at = cached_payload.get("created_at", "unknown")
+    papers = cached_payload.get("papers", [])
+    run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if papers:
+        cached_body = generate_markdown(papers, keywords, categories, days)
+    else:
+        cached_body = "\n".join(
+            [
+                "# Cached PaperFetch Search Result",
+                "",
+                "The cached successful run had no matching papers.",
+                "",
+                f"- Search window: last {days} days",
+                f"- arXiv categories: {', '.join(categories)}",
+                f"- Keywords: {', '.join(keywords)}",
+                "- Cached matched paper count: 0",
+            ]
+        )
+    header = "\n".join(
+        [
+            "# PaperFetch Cached Digest",
+            "",
+            "PaperFetch could not reach arXiv successfully in this run, so this email uses the latest successful cached results.",
+            "",
+            f"- Error type: {type(error).__name__}",
+            f"- Error message: {error}",
+            f"- Cache created_at: {cached_created_at}",
+            f"- Search window: last {days} days",
+            f"- arXiv categories: {', '.join(categories)}",
+            f"- Keyword count: {len(keywords)}",
+            f"- Cached paper count: {len(papers)}",
+            f"- Run time: {run_time}",
+            "",
+            "These results are not from a fresh arXiv request today.",
+            "",
+        ]
+    )
+    return f"{header}\n{cached_body}"
 
 
 def generate_markdown(papers: list[dict[str, Any]], keywords: list[str], categories: list[str], days: int) -> str:
@@ -559,6 +720,7 @@ def main() -> int:
     LOGGER.info("starting PaperFetch days=%s max_results=%s", args.days, min(args.max_results, 100))
 
     should_send_email = not args.dry_run and not args.no_email
+    cache_fallback_enabled = not args.no_cache_fallback
 
     try:
         papers = fetch_arxiv_papers(
@@ -570,8 +732,42 @@ def main() -> int:
         )
     except Exception as exc:
         LOGGER.exception("Failed to fetch arXiv papers")
+
+        cached_payload = None
+        if cache_fallback_enabled:
+            cached_payload = load_latest_cache(
+                keywords=keywords,
+                categories=categories,
+                days=args.days,
+                max_results=args.max_results,
+                max_age_days=args.cache_fallback_max_age_days,
+            )
+
+        if cached_payload is not None:
+            subject = build_cache_fallback_subject(args.days)
+            report = build_cache_fallback_report(exc, cached_payload, keywords, categories, args.days)
+            if should_send_email:
+                try:
+                    send_email(subject, report)
+                    LOGGER.info("cache fallback email sent to configured receiver")
+                except Exception:
+                    LOGGER.exception("Failed to send cache fallback email")
+                    return 1
+            else:
+                LOGGER.info("cache fallback email not sent because dry_run=%s no_email=%s", args.dry_run, args.no_email)
+                LOGGER.debug("generated cache fallback report:\n%s", report)
+            return 0
+
         subject = build_failure_subject(args.days)
-        report = build_failure_report(exc, keywords, categories, args.days, args.max_results)
+        report = build_failure_report(
+            exc,
+            keywords,
+            categories,
+            args.days,
+            args.max_results,
+            cache_checked=cache_fallback_enabled,
+            cache_hit=False,
+        )
         if should_send_email:
             try:
                 send_email(subject, report)
@@ -584,6 +780,10 @@ def main() -> int:
         return 1
 
     LOGGER.info("final paper count=%s", len(papers))
+    try:
+        write_latest_cache(keywords, categories, args.days, args.max_results, papers)
+    except Exception:
+        LOGGER.exception("Failed to write latest arXiv cache")
 
     if not papers:
         LOGGER.info("No matched papers found, sending empty report email.")
