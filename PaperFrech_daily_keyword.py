@@ -10,15 +10,15 @@ import json
 import logging
 import random
 import re
-import socket
 import time
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus
-from urllib.request import Request, urlopen
+
+import requests
+from requests import HTTPError, RequestException, Timeout
 
 CONFIG_DIR = Path("./config")
 CACHE_DIR = Path("./cache")
@@ -63,13 +63,13 @@ KEYWORDS = [
     "optimal transport alignment",
     "adversarial alignment",
 ]
-DAYS = 20
+DAYS = 7
 MAX_RESULTS = 100
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT = (10, 60)
 MIN_ARXIV_INTERVAL_SECONDS = 10.0
 KEYWORD_BATCH_SIZE = 30
 BATCH_SLEEP_SECONDS = 120
-MAX_ARXIV_RETRIES = 3
+MAX_ARXIV_RETRIES = 5
 MAX_ARXIV_429_RETRIES = 1
 MAX_BACKOFF_SECONDS = 300.0
 CACHE_FALLBACK_MAX_AGE_DAYS = 7
@@ -191,7 +191,8 @@ def wait_for_arxiv_rate_limit() -> None:
 
 
 def retry_after_seconds(exc: HTTPError) -> float | None:
-    value = exc.headers.get("Retry-After") if exc.headers else None
+    response = getattr(exc, "response", None)
+    value = response.headers.get("Retry-After") if response is not None else None
     if not value:
         return None
     try:
@@ -211,7 +212,7 @@ def backoff_seconds(attempt: int, exc: Exception) -> float:
         retry_after = retry_after_seconds(exc)
         if retry_after is not None:
             return min(retry_after, MAX_BACKOFF_SECONDS)
-    schedule = [30, 60, 120]
+    schedule = [5, 10, 20, 40, 80]
     base = schedule[min(attempt, len(schedule) - 1)]
     return min(base + random.uniform(0, 10), MAX_BACKOFF_SECONDS)
 
@@ -223,13 +224,18 @@ def rate_limited_fetch(url: str, max_retries: int = MAX_ARXIV_RETRIES) -> bytes:
         try:
             LOGGER.info("arXiv request attempt=%s max_retries=%s", attempt + 1, max_retries)
             wait_for_arxiv_rate_limit()
-            req = Request(url, headers={"User-Agent": USER_AGENT})
-            with urlopen(req, timeout=REQUEST_TIMEOUT) as response:
-                return response.read()
+            response = requests.get(
+                url,
+                headers={"User-Agent": USER_AGENT},
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            return response.content
         except HTTPError as exc:
             last_error = exc
+            status_code = exc.response.status_code if exc.response is not None else None
 
-            if exc.code == 429:
+            if status_code == 429:
                 rate_limit_count += 1
                 LOGGER.warning("HTTP 429 from arXiv; this run will stop if rate limit persists")
                 LOGGER.warning(
@@ -252,12 +258,16 @@ def rate_limited_fetch(url: str, max_retries: int = MAX_ARXIV_RETRIES) -> bytes:
 
             LOGGER.warning("recoverable arXiv HTTP failure: %r", exc)
 
-        except (URLError, TimeoutError, socket.timeout) as exc:
+        except Timeout as exc:
             last_error = exc
-            if isinstance(exc, (TimeoutError, socket.timeout)):
-                LOGGER.warning("timeout while requesting arXiv")
-            else:
-                LOGGER.warning("recoverable arXiv request failure: %r", exc)
+            LOGGER.warning("timeout while requesting arXiv")
+
+            if attempt >= max_retries - 1:
+                break
+
+        except RequestException as exc:
+            last_error = exc
+            LOGGER.warning("recoverable arXiv request failure: %r", exc)
 
             if attempt >= max_retries - 1:
                 break
@@ -269,7 +279,9 @@ def rate_limited_fetch(url: str, max_retries: int = MAX_ARXIV_RETRIES) -> bytes:
         LOGGER.info("retry after %.2fs", sleep_for)
         time.sleep(sleep_for)
 
-    raise ArxivFetchError(f"Failed to fetch arXiv feed after {max_retries} retries: {last_error}") from last_error
+    raise ArxivFetchError(
+        f"Failed to fetch arXiv feed after {max_retries} retries for url={url}: {last_error!r}"
+    ) from last_error
 
 
 def parse_feed(data: bytes) -> Any:
