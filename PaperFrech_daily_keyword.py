@@ -72,6 +72,8 @@ BATCH_SLEEP_SECONDS = 120
 MAX_ARXIV_RETRIES = 5
 MAX_ARXIV_429_RETRIES = 1
 MAX_BACKOFF_SECONDS = 300.0
+DEFAULT_ARXIV_429_WAIT_SECONDS = 300.0
+MAX_ARXIV_429_WAIT_SECONDS = 300.0
 CACHE_FALLBACK_MAX_AGE_DAYS = 7
 USER_AGENT = "PaperFetch/1.0 contact: oymk66666@outlook.com"
 SMTP_HOST = "smtp.qq.com"
@@ -208,13 +210,25 @@ def retry_after_seconds(exc: HTTPError) -> float | None:
 
 
 def backoff_seconds(attempt: int, exc: Exception) -> float:
-    if isinstance(exc, HTTPError):
-        retry_after = retry_after_seconds(exc)
-        if retry_after is not None:
-            return min(retry_after, MAX_BACKOFF_SECONDS)
     schedule = [5, 10, 20, 40, 80]
     base = schedule[min(attempt, len(schedule) - 1)]
     return min(base + random.uniform(0, 10), MAX_BACKOFF_SECONDS)
+
+
+def arxiv_429_retry_delay(exc: HTTPError) -> tuple[float, str]:
+    retry_after = retry_after_seconds(exc)
+    if retry_after is None:
+        return DEFAULT_ARXIV_429_WAIT_SECONDS, "default"
+    return retry_after, "Retry-After"
+
+
+def raise_arxiv_rate_limit_error(message: str, exc: HTTPError) -> None:
+    LOGGER.warning("arXiv rate limit will fall back to the latest successful cache: %s", message)
+    raise ArxivRateLimitError(
+        "arXiv returned HTTP 429 Too Many Requests. "
+        f"{message} "
+        "Stop this run and use cached results if available."
+    ) from exc
 
 
 def rate_limited_fetch(url: str, max_retries: int = MAX_ARXIV_RETRIES) -> bytes:
@@ -237,22 +251,29 @@ def rate_limited_fetch(url: str, max_retries: int = MAX_ARXIV_RETRIES) -> bytes:
 
             if status_code == 429:
                 rate_limit_count += 1
-                LOGGER.warning("HTTP 429 from arXiv; this run will stop if rate limit persists")
                 LOGGER.warning(
-                    "HTTP 429 from arXiv rate_limit_count=%s max_429_retries=%s",
+                    "HTTP 429 from arXiv rate_limit_count=%s max_429_retries=%s attempt=%s",
                     rate_limit_count,
                     MAX_ARXIV_429_RETRIES,
+                    attempt + 1,
                 )
 
                 if rate_limit_count > MAX_ARXIV_429_RETRIES or attempt >= max_retries - 1:
-                    raise ArxivRateLimitError(
-                        "arXiv returned HTTP 429 Too Many Requests. "
-                        "Stop this run to avoid worsening the rate limit. "
-                        "Try again later or reduce query frequency."
-                    ) from exc
+                    raise_arxiv_rate_limit_error("Rate limit persisted after one retry.", exc)
 
-                sleep_for = backoff_seconds(attempt, exc)
-                LOGGER.info("rate limited by arXiv; retry after %.2fs", sleep_for)
+                sleep_for, wait_source = arxiv_429_retry_delay(exc)
+                if wait_source == "Retry-After" and sleep_for > MAX_ARXIV_429_WAIT_SECONDS:
+                    raise_arxiv_rate_limit_error(
+                        f"Retry-After requested {sleep_for:.2f}s, which exceeds the "
+                        f"{MAX_ARXIV_429_WAIT_SECONDS:.0f}s per-run wait limit.",
+                        exc,
+                    )
+
+                LOGGER.warning(
+                    "rate limited by arXiv; wait %.2fs before the only retry wait_source=%s",
+                    sleep_for,
+                    wait_source,
+                )
                 time.sleep(sleep_for)
                 continue
 
@@ -326,11 +347,11 @@ def load_cache(path: Path) -> list[dict[str, Any]] | None:
         return None
     with path.open("r", encoding="utf-8") as fp:
         payload = json.load(fp)
-    papers = payload.get("papers", [])
-    if not papers:
-        LOGGER.info("ignoring empty arXiv cache: %s", path)
+    papers = payload.get("papers")
+    if not isinstance(papers, list):
+        LOGGER.warning("ignoring invalid arXiv cache without a paper list: %s", path)
         return None
-    LOGGER.info("loaded arXiv cache: %s", path)
+    LOGGER.info("loaded arXiv cache: %s paper_count=%s", path, len(papers))
     return papers
 
 
@@ -528,10 +549,8 @@ def fetch_arxiv_papers(
             for paper in batch_papers:
                 papers_by_id[paper["arxiv_id"]] = paper
 
-            if not no_cache and batch_papers:
+            if not no_cache:
                 write_cache(path, raw_query, batch_papers)
-            elif not no_cache:
-                LOGGER.info("No papers found for batch %s, skip writing empty cache.", index)
         except ArxivRateLimitError:
             LOGGER.exception(
                 "arXiv rate limited at keyword batch %s/%s; stop remaining batches",
@@ -756,6 +775,11 @@ def main() -> int:
             )
 
         if cached_payload is not None:
+            LOGGER.warning(
+                "using latest successful cache after arXiv failure created_at=%s path=%s",
+                cached_payload.get("created_at", "unknown"),
+                cached_payload.get("path", "unknown"),
+            )
             subject = build_cache_fallback_subject(args.days)
             report = build_cache_fallback_report(exc, cached_payload, keywords, categories, args.days)
             if should_send_email:
@@ -770,6 +794,7 @@ def main() -> int:
                 LOGGER.debug("generated cache fallback report:\n%s", report)
             return 0
 
+        LOGGER.warning("no eligible latest cache available after arXiv failure")
         subject = build_failure_subject(args.days)
         report = build_failure_report(
             exc,
