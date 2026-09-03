@@ -13,11 +13,17 @@ from requests import HTTPError, Timeout
 import PaperFrech_daily_keyword as paperfetch
 
 
-def response(status_code: int, content: bytes = b"", retry_after: str | None = None) -> requests.Response:
+def response(
+    status_code: int,
+    content: bytes = b"",
+    retry_after: str | None = None,
+    headers: dict[str, str] | None = None,
+) -> requests.Response:
     result = requests.Response()
     result.status_code = status_code
     result._content = content
     result.url = "https://export.arxiv.org/api/query"
+    result.headers.update(headers or {})
     if retry_after is not None:
         result.headers["Retry-After"] = retry_after
     return result
@@ -49,7 +55,7 @@ class RetryAfterTests(unittest.TestCase):
 
 
 class RequestConstructionTests(unittest.TestCase):
-    def test_builds_post_parameters_without_a_long_query_url(self):
+    def test_builds_get_parameters_without_embedding_query_in_endpoint(self):
         endpoint, params, raw_query = paperfetch.build_arxiv_request(
             ["cs.CV", "cs.AI"],
             ["vision-language alignment", "multimodal alignment"],
@@ -75,59 +81,51 @@ class RateLimitedFetchTests(unittest.TestCase):
         "sortOrder": "descending",
     }
 
-    def fetch_with(self, side_effect, max_retries=5):
+    def fetch_with(self, side_effect, max_retries=3):
         with tempfile.TemporaryDirectory() as directory:
             with (
                 patch.object(paperfetch, "CACHE_DIR", Path(directory)),
                 patch.object(paperfetch, "datetime", FixedDateTime),
                 patch.object(paperfetch, "wait_for_arxiv_rate_limit"),
-                patch.object(paperfetch.requests, "post", side_effect=side_effect) as post,
+                patch.object(paperfetch.requests, "get", side_effect=side_effect) as get,
                 patch.object(paperfetch.time, "sleep") as sleep,
-                patch.object(paperfetch.random, "uniform", return_value=0.0),
             ):
                 result = paperfetch.rate_limited_fetch(
                     paperfetch.ARXIV_API_URL,
                     self.params,
                     max_retries=max_retries,
                 )
-        return result, post, sleep
+        return result, get, sleep
 
-    def test_success_uses_post_parameters_and_user_agent(self):
-        result, post, sleep = self.fetch_with([response(200, b"ok")])
+    def test_success_uses_get_parameters_and_user_agent(self):
+        result, get, sleep = self.fetch_with([response(200, b"ok")])
 
         self.assertEqual(result, b"ok")
-        post.assert_called_once_with(
+        get.assert_called_once_with(
             paperfetch.ARXIV_API_URL,
-            data=self.params,
+            params=self.params,
             headers={"User-Agent": paperfetch.USER_AGENT},
             timeout=paperfetch.REQUEST_TIMEOUT,
         )
         sleep.assert_not_called()
 
-    def test_429_without_header_stops_and_blocks_same_utc_day(self):
-        with tempfile.TemporaryDirectory() as directory:
-            with (
-                patch.object(paperfetch, "CACHE_DIR", Path(directory)),
-                patch.object(paperfetch, "datetime", FixedDateTime),
-                patch.object(paperfetch, "wait_for_arxiv_rate_limit"),
-                patch.object(paperfetch.requests, "post", return_value=response(429)) as post,
-                patch.object(paperfetch.time, "sleep") as sleep,
-            ):
-                with self.assertRaises(paperfetch.ArxivRateLimitError):
-                    paperfetch.rate_limited_fetch(paperfetch.ARXIV_API_URL, self.params)
+    def test_503_waits_five_minutes_once_then_succeeds(self):
+        result, get, sleep = self.fetch_with([response(503), response(200, b"ok")])
 
-                state = paperfetch.load_arxiv_rate_limit_state()
-                self.assertEqual(state["wait_source"], "utc-day")
-                self.assertNotIn("retry_after_until", state)
-                post.assert_called_once()
-                sleep.assert_not_called()
+        self.assertEqual(result, b"ok")
+        self.assertEqual(get.call_count, 2)
+        sleep.assert_called_once_with(300.0)
 
-                with patch.object(paperfetch.requests, "post") as blocked_post:
-                    with self.assertRaises(paperfetch.ArxivRateLimitCooldownError):
-                        paperfetch.rate_limited_fetch(paperfetch.ARXIV_API_URL, self.params)
-                blocked_post.assert_not_called()
+    def test_short_retry_after_controls_the_only_capacity_retry(self):
+        result, get, sleep = self.fetch_with(
+            [response(429, retry_after="120"), response(200, b"ok")]
+        )
 
-    def test_429_retry_after_persists_exact_deadline_without_sleep(self):
+        self.assertEqual(result, b"ok")
+        self.assertEqual(get.call_count, 2)
+        sleep.assert_called_once_with(120.0)
+
+    def test_503_then_429_stops_and_records_thirty_minute_cooldown(self):
         with tempfile.TemporaryDirectory() as directory:
             with (
                 patch.object(paperfetch, "CACHE_DIR", Path(directory)),
@@ -135,16 +133,60 @@ class RateLimitedFetchTests(unittest.TestCase):
                 patch.object(paperfetch, "wait_for_arxiv_rate_limit"),
                 patch.object(
                     paperfetch.requests,
-                    "post",
-                    return_value=response(429, retry_after="120"),
-                ) as post,
+                    "get",
+                    side_effect=[response(503, b"Service Unavailable"), response(429, b"Rate exceeded.")],
+                ) as get,
+                patch.object(paperfetch.time, "sleep") as sleep,
+            ):
+                with self.assertRaises(paperfetch.ArxivRateLimitError) as raised:
+                    paperfetch.rate_limited_fetch(paperfetch.ARXIV_API_URL, self.params)
+
+                state = paperfetch.load_arxiv_rate_limit_state()
+                self.assertEqual(raised.exception.status_sequence, [503, 429])
+                self.assertEqual(state["last_status"], 429)
+                self.assertEqual(state["last_failure_at"], FixedDateTime.current.isoformat())
+                self.assertEqual(state["response_hint"], "Rate exceeded.")
+                self.assertEqual(
+                    paperfetch.parse_cache_datetime(state["retry_after_until"]),
+                    FixedDateTime.current + timedelta(minutes=30),
+                )
+                self.assertEqual(get.call_count, 2)
+                sleep.assert_called_once_with(300.0)
+
+    def test_429_retries_once_then_stops(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(paperfetch, "CACHE_DIR", Path(directory)),
+                patch.object(paperfetch, "datetime", FixedDateTime),
+                patch.object(paperfetch, "wait_for_arxiv_rate_limit"),
+                patch.object(paperfetch.requests, "get", return_value=response(429)) as get,
+                patch.object(paperfetch.time, "sleep") as sleep,
+            ):
+                with self.assertRaises(paperfetch.ArxivRateLimitError) as raised:
+                    paperfetch.rate_limited_fetch(paperfetch.ARXIV_API_URL, self.params)
+
+            self.assertEqual(raised.exception.status_sequence, [429, 429])
+            self.assertEqual(get.call_count, 2)
+            sleep.assert_called_once_with(300.0)
+
+    def test_long_retry_after_persists_exact_deadline_without_sleep(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(paperfetch, "CACHE_DIR", Path(directory)),
+                patch.object(paperfetch, "datetime", FixedDateTime),
+                patch.object(paperfetch, "wait_for_arxiv_rate_limit"),
+                patch.object(
+                    paperfetch.requests,
+                    "get",
+                    return_value=response(429, retry_after="600"),
+                ) as get,
                 patch.object(paperfetch.time, "sleep") as sleep,
             ):
                 with self.assertRaises(paperfetch.ArxivRateLimitError):
                     paperfetch.rate_limited_fetch(paperfetch.ARXIV_API_URL, self.params)
 
                 state = paperfetch.load_arxiv_rate_limit_state()
-                expected = FixedDateTime.current + timedelta(seconds=120)
+                expected = FixedDateTime.current + timedelta(seconds=600)
                 self.assertEqual(
                     paperfetch.parse_cache_datetime(state["retry_after_until"]),
                     expected,
@@ -152,17 +194,59 @@ class RateLimitedFetchTests(unittest.TestCase):
                 self.assertIsNotNone(
                     paperfetch.active_arxiv_rate_limit_cooldown(
                         state,
-                        now=FixedDateTime.current + timedelta(seconds=119),
+                        now=FixedDateTime.current + timedelta(seconds=599),
                     )
                 )
                 self.assertIsNone(
                     paperfetch.active_arxiv_rate_limit_cooldown(
                         state,
-                        now=FixedDateTime.current + timedelta(seconds=121),
+                        now=FixedDateTime.current + timedelta(seconds=601),
                     )
                 )
-                post.assert_called_once()
+                get.assert_called_once()
                 sleep.assert_not_called()
+
+    def test_active_cooldown_blocks_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "arxiv_rate_limit_state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "last_status": 503,
+                        "last_failure_at": FixedDateTime.current.isoformat(),
+                        "retry_after_until": (
+                            FixedDateTime.current + timedelta(minutes=10)
+                        ).isoformat(),
+                        "response_hint": "busy",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(paperfetch, "CACHE_DIR", Path(directory)),
+                patch.object(paperfetch, "datetime", FixedDateTime),
+                patch.object(paperfetch.requests, "get") as get,
+            ):
+                with self.assertRaises(paperfetch.ArxivRateLimitCooldownError):
+                    paperfetch.rate_limited_fetch(paperfetch.ARXIV_API_URL, self.params)
+
+            get.assert_not_called()
+
+    def test_legacy_utc_day_state_expires_after_thirty_minutes(self):
+        state = {"last_429_at": FixedDateTime.current.isoformat(), "wait_source": "utc-day"}
+
+        self.assertIsNotNone(
+            paperfetch.active_arxiv_rate_limit_cooldown(
+                state,
+                now=FixedDateTime.current + timedelta(minutes=29),
+            )
+        )
+        self.assertIsNone(
+            paperfetch.active_arxiv_rate_limit_cooldown(
+                state,
+                now=FixedDateTime.current + timedelta(minutes=31),
+            )
+        )
 
     def test_success_clears_expired_rate_limit_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -170,11 +254,10 @@ class RateLimitedFetchTests(unittest.TestCase):
             state_path.write_text(
                 json.dumps(
                     {
-                        "last_429_at": FixedDateTime.current.isoformat(),
-                        "retry_after_until": (
-                            FixedDateTime.current - timedelta(seconds=1)
+                        "last_429_at": (
+                            FixedDateTime.current - timedelta(minutes=31)
                         ).isoformat(),
-                        "wait_source": "Retry-After",
+                        "wait_source": "utc-day",
                     }
                 ),
                 encoding="utf-8",
@@ -183,7 +266,7 @@ class RateLimitedFetchTests(unittest.TestCase):
                 patch.object(paperfetch, "CACHE_DIR", Path(directory)),
                 patch.object(paperfetch, "datetime", FixedDateTime),
                 patch.object(paperfetch, "wait_for_arxiv_rate_limit"),
-                patch.object(paperfetch.requests, "post", return_value=response(200, b"ok")),
+                patch.object(paperfetch.requests, "get", return_value=response(200, b"ok")),
             ):
                 result = paperfetch.rate_limited_fetch(paperfetch.ARXIV_API_URL, self.params)
 
@@ -197,7 +280,7 @@ class RateLimitedFetchTests(unittest.TestCase):
             with (
                 patch.object(paperfetch, "CACHE_DIR", Path(directory)),
                 patch.object(paperfetch, "wait_for_arxiv_rate_limit"),
-                patch.object(paperfetch.requests, "post", return_value=response(200, b"ok")),
+                patch.object(paperfetch.requests, "get", return_value=response(200, b"ok")),
             ):
                 result = paperfetch.rate_limited_fetch(paperfetch.ARXIV_API_URL, self.params)
 
@@ -209,34 +292,71 @@ class RateLimitedFetchTests(unittest.TestCase):
             with (
                 patch.object(paperfetch, "CACHE_DIR", Path(directory)),
                 patch.object(paperfetch, "wait_for_arxiv_rate_limit"),
-                patch.object(paperfetch.requests, "post", return_value=response(400)) as post,
+                patch.object(paperfetch.requests, "get", return_value=response(400)) as get,
                 patch.object(paperfetch.time, "sleep") as sleep,
             ):
                 with self.assertRaises(paperfetch.ArxivFetchError):
                     paperfetch.rate_limited_fetch(paperfetch.ARXIV_API_URL, self.params)
 
-        post.assert_called_once()
+        get.assert_called_once()
         sleep.assert_not_called()
 
-    def test_server_error_uses_short_normal_backoff(self):
-        result, post, sleep = self.fetch_with([response(503), response(200, b"ok")])
+    def test_normal_server_errors_use_ten_and_thirty_second_backoff(self):
+        result, get, sleep = self.fetch_with(
+            [response(500), response(502), response(200, b"ok")]
+        )
         self.assertEqual(result, b"ok")
-        self.assertEqual(post.call_count, 2)
-        sleep.assert_called_once_with(5.0)
+        self.assertEqual(get.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [10.0, 30.0])
+
+    def test_normal_server_errors_stop_after_three_attempts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(paperfetch, "CACHE_DIR", Path(directory)),
+                patch.object(paperfetch, "wait_for_arxiv_rate_limit"),
+                patch.object(paperfetch.requests, "get", return_value=response(500)) as get,
+                patch.object(paperfetch.time, "sleep") as sleep,
+            ):
+                with self.assertRaises(paperfetch.ArxivFetchError):
+                    paperfetch.rate_limited_fetch(paperfetch.ARXIV_API_URL, self.params)
+
+        self.assertEqual(get.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [10.0, 30.0])
 
     def test_timeout_uses_short_normal_backoff(self):
-        result, post, sleep = self.fetch_with([Timeout("timed out"), response(200, b"ok")])
+        result, get, sleep = self.fetch_with([Timeout("timed out"), response(200, b"ok")])
         self.assertEqual(result, b"ok")
-        self.assertEqual(post.call_count, 2)
-        sleep.assert_called_once_with(5.0)
+        self.assertEqual(get.call_count, 2)
+        sleep.assert_called_once_with(10.0)
 
     def test_connection_error_uses_short_normal_backoff(self):
-        result, post, sleep = self.fetch_with(
+        result, get, sleep = self.fetch_with(
             [requests.ConnectionError("connection failed"), response(200, b"ok")]
         )
         self.assertEqual(result, b"ok")
-        self.assertEqual(post.call_count, 2)
-        sleep.assert_called_once_with(5.0)
+        self.assertEqual(get.call_count, 2)
+        sleep.assert_called_once_with(10.0)
+
+    def test_http_diagnostics_include_capacity_headers_and_body(self):
+        failure = response(
+            400,
+            b"Rate exceeded.",
+            headers={"X-Cache": "MISS", "Via": "1.1 varnish", "Date": "today"},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(paperfetch, "CACHE_DIR", Path(directory)),
+                patch.object(paperfetch, "wait_for_arxiv_rate_limit"),
+                patch.object(paperfetch.requests, "get", return_value=failure),
+                self.assertLogs("paperfetch", level="WARNING") as logs,
+            ):
+                with self.assertRaises(paperfetch.ArxivFetchError):
+                    paperfetch.rate_limited_fetch(paperfetch.ARXIV_API_URL, self.params)
+
+        combined = "\n".join(logs.output)
+        self.assertIn("x_cache='MISS'", combined)
+        self.assertIn("via='1.1 varnish'", combined)
+        self.assertIn("body='Rate exceeded.'", combined)
 
 
 class EmptyCacheTests(unittest.TestCase):
@@ -282,7 +402,7 @@ class CacheFallbackMainTests(unittest.TestCase):
             log_level="INFO",
         )
 
-    def test_429_with_latest_cache_sends_cached_digest_and_returns_success(self):
+    def test_service_busy_with_latest_cache_sends_cached_digest_and_returns_success(self):
         cached_payload = {
             "created_at": "2026-08-11T01:00:00+00:00",
             "papers": [],
@@ -294,7 +414,10 @@ class CacheFallbackMainTests(unittest.TestCase):
             patch.object(
                 paperfetch,
                 "fetch_arxiv_papers",
-                side_effect=paperfetch.ArxivRateLimitError("live HTTP 429"),
+                side_effect=paperfetch.ArxivServiceBusyError(
+                    "arXiv temporarily unavailable",
+                    [503, 429],
+                ),
             ),
             patch.object(paperfetch, "load_latest_cache", return_value=cached_payload),
             patch.object(paperfetch, "send_email") as send_email,
@@ -305,16 +428,21 @@ class CacheFallbackMainTests(unittest.TestCase):
         send_email.assert_called_once()
         subject, body = send_email.call_args.args
         self.assertIn("using cached results", subject)
-        self.assertIn("arXiv rejected this run's request with HTTP 429", body)
+        self.assertIn("arXiv was temporarily unavailable", body)
+        self.assertIn("arXiv response sequence: 503 -> 429", body)
+        self.assertIn("Cache created_at: 2026-08-11T01:00:00+00:00", body)
 
-    def test_429_without_latest_cache_sends_failure_and_returns_error(self):
+    def test_service_busy_without_latest_cache_sends_failure_and_returns_error(self):
         with (
             patch.object(paperfetch, "parse_args", return_value=self.args()),
             patch.object(paperfetch, "configure_logging"),
             patch.object(
                 paperfetch,
                 "fetch_arxiv_papers",
-                side_effect=paperfetch.ArxivRateLimitError("live HTTP 429"),
+                side_effect=paperfetch.ArxivServiceBusyError(
+                    "arXiv temporarily unavailable",
+                    [503, 429],
+                ),
             ),
             patch.object(paperfetch, "load_latest_cache", return_value=None),
             patch.object(paperfetch, "send_email") as send_email,
@@ -324,8 +452,9 @@ class CacheFallbackMainTests(unittest.TestCase):
         self.assertEqual(result, 1)
         send_email.assert_called_once()
         subject, body = send_email.call_args.args
-        self.assertIn("arXiv request failed", subject)
-        self.assertIn("arXiv rejected this run's request with HTTP 429", body)
+        self.assertIn("arXiv temporarily unavailable", subject)
+        self.assertIn("arXiv was temporarily unavailable", body)
+        self.assertIn("arXiv response sequence: 503 -> 429", body)
 
     def test_cooldown_report_says_no_live_request_was_made(self):
         report = paperfetch.build_cache_fallback_report(

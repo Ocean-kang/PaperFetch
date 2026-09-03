@@ -187,8 +187,11 @@ Recommended frequency is once per day, or at most once every 12 hours:
 ```
 
 Do not keep a test schedule such as `* * * * *` or `*/5 * * * *` for PaperFetch in production.
-High-frequency runs can trigger arXiv HTTP 429 rate limits. The `run.sh` wrapper also uses
-`flock` so an accidental high-frequency cron entry will not run concurrent jobs.
+High-frequency runs can trigger arXiv HTTP 429 rate limits. PaperFetch uses cache-friendly
+GET requests and treats HTTP 429 and 503 as temporary service-capacity signals: it waits at
+most five minutes, retries once, and then falls back to the latest successful cache. The
+`run.sh` wrapper also uses `flock` so an accidental high-frequency cron entry will not run
+concurrent jobs.
 
 Useful deployment checks:
 
@@ -465,9 +468,9 @@ tail -n 100 log/run.log
 
 ### 5. `PaperFetch Run Failed` Emails
 
-The keyword digest sends a failure email when every arXiv keyword batch fails or when arXiv returns a persistent HTTP 429 rate-limit response. Common causes are arXiv rate limiting, temporary network timeouts, or server connectivity trouble.
+The keyword digest sends a failure email when every arXiv keyword batch fails or when arXiv remains unavailable after a limited retry. HTTP 429 and 503 can reflect arXiv-wide service capacity, a shared outbound IP, or caller traffic; a 429 response does not by itself prove that this task ran too frequently. PaperFetch waits at most five minutes before one capacity retry, then records a 30-minute cooldown when arXiv does not provide a `Retry-After` deadline.
 
-If a recent successful digest cache exists, PaperFetch sends a cached digest instead of a full failure email. The subject includes `using cached results`, and the body lists the cache `created_at` time. This means the current arXiv request failed; the papers in that email came from the latest successful cached run, not from a fresh arXiv response that day.
+If a recent successful digest cache exists, PaperFetch sends a cached digest instead of a full failure email. The subject includes `using cached results`, and the body lists the cache `created_at` time and HTTP response sequence. This means the current arXiv request failed; the papers in that email came from the latest successful cached run, not from a fresh arXiv response that day.
 
 Useful checks:
 

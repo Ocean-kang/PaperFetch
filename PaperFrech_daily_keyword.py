@@ -9,7 +9,6 @@ import hashlib
 import json
 import logging
 import os
-import random
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -70,8 +69,11 @@ REQUEST_TIMEOUT = (10, 60)
 MIN_ARXIV_INTERVAL_SECONDS = 10.0
 KEYWORD_BATCH_SIZE = 30
 BATCH_SLEEP_SECONDS = 120
-MAX_ARXIV_RETRIES = 5
-MAX_BACKOFF_SECONDS = 300.0
+MAX_ARXIV_RETRIES = 3
+NORMAL_RETRY_DELAYS_SECONDS = (10.0, 30.0)
+DEFAULT_ARXIV_BUSY_WAIT_SECONDS = 300.0
+MAX_ARXIV_BUSY_WAIT_SECONDS = 300.0
+DEFAULT_ARXIV_COOLDOWN_SECONDS = 1800.0
 CACHE_FALLBACK_MAX_AGE_DAYS = 7
 USER_AGENT = "PaperFetch/1.0 contact: oymk66666@outlook.com"
 SMTP_HOST = "smtp.qq.com"
@@ -85,12 +87,20 @@ class ArxivFetchError(RuntimeError):
     """Base exception for arXiv fetch failures."""
 
 
-class ArxivRateLimitError(ArxivFetchError):
+class ArxivServiceBusyError(ArxivFetchError):
+    """Raised when arXiv reports a capacity or rate-limit failure."""
+
+    def __init__(self, message: str, status_sequence: list[int] | None = None):
+        super().__init__(message)
+        self.status_sequence = list(status_sequence or [])
+
+
+class ArxivRateLimitError(ArxivServiceBusyError):
     """Raised when arXiv returns HTTP 429 rate limit."""
 
 
-class ArxivRateLimitCooldownError(ArxivRateLimitError):
-    """Raised when a previous HTTP 429 prevents another request."""
+class ArxivRateLimitCooldownError(ArxivServiceBusyError):
+    """Raised when a recorded arXiv service-busy cooldown is active."""
 
 
 def parse_args() -> argparse.Namespace:
@@ -216,10 +226,10 @@ def retry_after_seconds(exc: HTTPError) -> float | None:
             return None
 
 
-def backoff_seconds(attempt: int, exc: Exception) -> float:
-    schedule = [5, 10, 20, 40, 80]
-    base = schedule[min(attempt, len(schedule) - 1)]
-    return min(base + random.uniform(0, 10), MAX_BACKOFF_SECONDS)
+def backoff_seconds(retry_index: int) -> float:
+    return NORMAL_RETRY_DELAYS_SECONDS[
+        min(retry_index, len(NORMAL_RETRY_DELAYS_SECONDS) - 1)
+    ]
 
 
 def arxiv_rate_limit_state_path() -> Path:
@@ -242,16 +252,46 @@ def load_arxiv_rate_limit_state() -> dict[str, Any] | None:
     return payload
 
 
-def write_arxiv_rate_limit_state(exc: HTTPError) -> dict[str, Any]:
+def response_body_hint(response: requests.Response, limit: int = 200) -> str:
+    text = response.content.decode(response.encoding or "utf-8", errors="replace")
+    return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
+def log_arxiv_http_failure(response: requests.Response, elapsed_seconds: float) -> str:
+    hint = response_body_hint(response)
+    LOGGER.warning(
+        "arXiv HTTP failure status=%s elapsed=%.2fs retry_after=%r x_cache=%r "
+        "via=%r date=%r body=%r",
+        response.status_code,
+        elapsed_seconds,
+        response.headers.get("Retry-After"),
+        response.headers.get("X-Cache"),
+        response.headers.get("Via"),
+        response.headers.get("Date"),
+        hint,
+    )
+    return hint
+
+
+def write_arxiv_rate_limit_state(
+    exc: HTTPError,
+    *,
+    fallback_cooldown_seconds: float = DEFAULT_ARXIV_COOLDOWN_SECONDS,
+    response_hint: str | None = None,
+) -> dict[str, Any]:
     path = arxiv_rate_limit_state_path()
     now = datetime.now(timezone.utc)
     retry_after = retry_after_seconds(exc)
+    response = getattr(exc, "response", None)
+    status_code = response.status_code if response is not None else None
+    cooldown_seconds = retry_after if retry_after is not None else fallback_cooldown_seconds
     payload: dict[str, Any] = {
-        "last_429_at": now.isoformat(),
-        "wait_source": "Retry-After" if retry_after is not None else "utc-day",
+        "last_status": status_code,
+        "last_failure_at": now.isoformat(),
+        "retry_after_until": (now + timedelta(seconds=cooldown_seconds)).isoformat(),
+        "response_hint": response_hint or "",
+        "wait_source": "Retry-After" if retry_after is not None else "default-cooldown",
     }
-    if retry_after is not None:
-        payload["retry_after_until"] = (now + timedelta(seconds=retry_after)).isoformat()
 
     temporary_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
@@ -268,10 +308,12 @@ def write_arxiv_rate_limit_state(exc: HTTPError) -> dict[str, Any]:
             LOGGER.warning("failed to remove temporary arXiv rate-limit state: %s", temporary_path)
 
     LOGGER.warning(
-        "recorded arXiv HTTP 429 state path=%s wait_source=%s retry_after_until=%s",
+        "recorded arXiv service-busy state path=%s status=%s wait_source=%s "
+        "retry_after_until=%s",
         path,
+        payload["last_status"],
         payload["wait_source"],
-        payload.get("retry_after_until", "next UTC day"),
+        payload["retry_after_until"],
     )
     return payload
 
@@ -281,7 +323,7 @@ def clear_arxiv_rate_limit_state() -> None:
     try:
         if path.exists():
             path.unlink()
-            LOGGER.info("cleared arXiv rate-limit state after a successful response: %s", path)
+            LOGGER.info("cleared arXiv service-busy state: %s", path)
     except OSError as exc:
         LOGGER.warning("failed to clear arXiv rate-limit state path=%s error=%r", path, exc)
 
@@ -300,12 +342,16 @@ def active_arxiv_rate_limit_cooldown(
     if retry_after_until_value:
         retry_after_until = parse_cache_datetime(retry_after_until_value)
         if retry_after_until is not None and retry_after_until > current:
-            return f"Retry-After cooldown is active until {retry_after_until.isoformat()}"
+            source = state.get("wait_source", "stored deadline")
+            return f"service-busy cooldown ({source}) is active until {retry_after_until.isoformat()}"
         return None
 
-    last_429_at = parse_cache_datetime(state.get("last_429_at", ""))
-    if last_429_at is not None and last_429_at.date() == current.date():
-        return f"an HTTP 429 was already received on UTC date {current.date().isoformat()}"
+    # Migrate the previous format without preserving its incorrect UTC-day block.
+    legacy_failure_at = parse_cache_datetime(state.get("last_429_at", ""))
+    if legacy_failure_at is not None:
+        legacy_deadline = legacy_failure_at + timedelta(seconds=DEFAULT_ARXIV_COOLDOWN_SECONDS)
+        if legacy_deadline > current:
+            return f"legacy service-busy cooldown is active until {legacy_deadline.isoformat()}"
     return None
 
 
@@ -315,6 +361,7 @@ def enforce_arxiv_rate_limit_cooldown() -> None:
         return
     reason = active_arxiv_rate_limit_cooldown(state)
     if reason is None:
+        clear_arxiv_rate_limit_state()
         return
     LOGGER.warning("skipping arXiv request because %s", reason)
     raise ArxivRateLimitCooldownError(
@@ -329,13 +376,18 @@ def rate_limited_fetch(
 ) -> bytes:
     enforce_arxiv_rate_limit_cooldown()
     last_error: Exception | None = None
+    status_sequence: list[int] = []
+    busy_retry_used = False
+    normal_retry_index = 0
+
     for attempt in range(max_retries):
         try:
-            LOGGER.info("arXiv POST request attempt=%s max_retries=%s", attempt + 1, max_retries)
+            LOGGER.info("arXiv GET request attempt=%s max_attempts=%s", attempt + 1, max_retries)
             wait_for_arxiv_rate_limit()
-            response = requests.post(
+            request_started = time.monotonic()
+            response = requests.get(
                 endpoint,
-                data=params,
+                params=params,
                 headers={"User-Agent": USER_AGENT},
                 timeout=REQUEST_TIMEOUT,
             )
@@ -345,15 +397,62 @@ def rate_limited_fetch(
         except HTTPError as exc:
             last_error = exc
             status_code = exc.response.status_code if exc.response is not None else None
+            if status_code is not None:
+                status_sequence.append(status_code)
+            response_hint = ""
+            if exc.response is not None:
+                response_hint = log_arxiv_http_failure(
+                    exc.response,
+                    time.monotonic() - request_started,
+                )
 
-            if status_code == 429:
-                state = write_arxiv_rate_limit_state(exc)
-                retry_detail = state.get("retry_after_until", "the next UTC day")
-                LOGGER.warning("arXiv returned HTTP 429; stop this run and use cache")
-                raise ArxivRateLimitError(
-                    "arXiv returned HTTP 429 Too Many Requests. "
-                    f"No in-run retry will be made; requests are blocked until {retry_detail}. "
-                    "Use cached results if available."
+            if status_code in (429, 503):
+                retry_after = retry_after_seconds(exc)
+                retry_wait = (
+                    retry_after
+                    if retry_after is not None
+                    else DEFAULT_ARXIV_BUSY_WAIT_SECONDS
+                )
+                may_retry = (
+                    not busy_retry_used
+                    and attempt < max_retries - 1
+                    and retry_wait <= MAX_ARXIV_BUSY_WAIT_SECONDS
+                )
+
+                if may_retry:
+                    busy_retry_used = True
+                    write_arxiv_rate_limit_state(
+                        exc,
+                        fallback_cooldown_seconds=retry_wait,
+                        response_hint=response_hint,
+                    )
+                    LOGGER.warning(
+                        "arXiv service busy status=%s; wait %.2fs before the only "
+                        "capacity retry response_sequence=%s",
+                        status_code,
+                        retry_wait,
+                        " -> ".join(str(value) for value in status_sequence),
+                    )
+                    time.sleep(retry_wait)
+                    continue
+
+                state = write_arxiv_rate_limit_state(
+                    exc,
+                    response_hint=response_hint,
+                )
+                retry_detail = state["retry_after_until"]
+                sequence = " -> ".join(str(value) for value in status_sequence)
+                LOGGER.warning(
+                    "arXiv remains unavailable; stop this run and use cache "
+                    "response_sequence=%s",
+                    sequence,
+                )
+                error_type = ArxivRateLimitError if status_code == 429 else ArxivServiceBusyError
+                raise error_type(
+                    "arXiv is temporarily unavailable due to service capacity or rate limiting. "
+                    f"Response sequence: {sequence}. Next request is allowed after "
+                    f"{retry_detail}. Use cached results if available.",
+                    status_sequence,
                 ) from exc
 
             if status_code is not None and 400 <= status_code < 500:
@@ -380,12 +479,15 @@ def rate_limited_fetch(
         if attempt >= max_retries - 1:
             break
 
-        sleep_for = backoff_seconds(attempt, last_error)
+        sleep_for = backoff_seconds(normal_retry_index)
+        normal_retry_index += 1
         LOGGER.info("retry after %.2fs", sleep_for)
         time.sleep(sleep_for)
 
     raise ArxivFetchError(
-        f"Failed to fetch arXiv feed after {max_retries} attempts at endpoint={endpoint}: {last_error!r}"
+        f"Failed to fetch arXiv feed after {max_retries} attempts at endpoint={endpoint}. "
+        f"Response sequence: {' -> '.join(str(value) for value in status_sequence) or 'none'}. "
+        f"Last error: {last_error!r}"
     ) from last_error
 
 
@@ -614,7 +716,7 @@ def fetch_arxiv_papers(
         path = cache_path(raw_query)
         LOGGER.info("arXiv keyword batch %s/%s size=%s", index, len(batches), len(batch))
         LOGGER.info(
-            "arXiv request method=POST endpoint=%s query_chars=%s max_results=%s",
+            "arXiv request method=GET endpoint=%s query_chars=%s max_results=%s",
             endpoint,
             len(raw_query),
             request_params["max_results"],
@@ -639,9 +741,9 @@ def fetch_arxiv_papers(
 
             if not no_cache:
                 write_cache(path, raw_query, batch_papers)
-        except ArxivRateLimitError:
+        except ArxivServiceBusyError:
             LOGGER.exception(
-                "arXiv rate limited at keyword batch %s/%s; stop remaining batches",
+                "arXiv service busy at keyword batch %s/%s; stop remaining batches",
                 index,
                 len(batches),
             )
@@ -675,11 +777,11 @@ def build_email_subject(papers: list[dict[str, Any]], days: int) -> str:
 
 
 def build_failure_subject(days: int) -> str:
-    return f"PaperFetch: arXiv request failed (last {days} days)"
+    return f"PaperFetch: arXiv temporarily unavailable (last {days} days)"
 
 
 def build_cache_fallback_subject(days: int) -> str:
-    return f"PaperFetch: arXiv request failed, using cached results (last {days} days)"
+    return f"PaperFetch: arXiv temporarily unavailable, using cached results (last {days} days)"
 
 
 def build_empty_report(keywords: list[str], categories: list[str], days: int) -> str:
@@ -704,18 +806,25 @@ def build_empty_report(keywords: list[str], categories: list[str], days: int) ->
 def arxiv_failure_context(error: Exception) -> tuple[str, str]:
     if isinstance(error, ArxivRateLimitCooldownError):
         return (
-            "PaperFetch skipped the arXiv request because a recorded rate-limit cooldown is still active.",
-            "No live arXiv request was made in this run; the cooldown prevents repeated requests after HTTP 429.",
+            "PaperFetch skipped the arXiv request because a recorded service-busy cooldown is still active.",
+            "No live arXiv request was made in this run; the cooldown prevents repeated requests while arXiv recovers.",
         )
-    if isinstance(error, ArxivRateLimitError):
+    if isinstance(error, ArxivServiceBusyError):
         return (
-            "arXiv rejected this run's request with HTTP 429 Too Many Requests.",
-            "The arXiv API rate limit is the confirmed cause.",
+            "arXiv was temporarily unavailable during this run because it returned HTTP 429 or 503.",
+            "This can reflect arXiv-wide service capacity, a shared outbound IP, or caller traffic; it does not by itself prove this task ran too frequently.",
         )
     return (
         "PaperFetch attempted the arXiv request, but no fresh paper results were produced.",
         "Likely causes include a non-retryable API response, network timeout, or temporary connectivity trouble.",
     )
+
+
+def arxiv_response_sequence(error: Exception) -> str | None:
+    sequence = getattr(error, "status_sequence", None)
+    if not sequence:
+        return None
+    return " -> ".join(str(status) for status in sequence)
 
 
 def build_failure_report(
@@ -730,6 +839,7 @@ def build_failure_report(
 ) -> str:
     run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     request_summary, cause = arxiv_failure_context(error)
+    response_sequence = arxiv_response_sequence(error) or "not available"
 
     cache_status = "not checked"
     if cache_checked:
@@ -744,6 +854,7 @@ def build_failure_report(
             "",
             f"- Error type: {type(error).__name__}",
             f"- Error message: {error}",
+            f"- arXiv response sequence: {response_sequence}",
             f"- Search window: last {days} days",
             f"- max_results: {min(max_results, 100)}",
             f"- arXiv categories: {', '.join(categories)}",
@@ -753,7 +864,7 @@ def build_failure_report(
             "",
             cause,
             "",
-            "Check log/run.log and confirm cron is not running PaperFetch too frequently. It is not an email configuration error if you received this message.",
+            "Check log/run.log for the response diagnostics and confirm cron has only one PaperFetch entry. It is not an email configuration error if you received this message.",
         ]
     )
 
@@ -769,6 +880,7 @@ def build_cache_fallback_report(
     papers = cached_payload.get("papers", [])
     run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     request_summary, _ = arxiv_failure_context(error)
+    response_sequence = arxiv_response_sequence(error) or "not available"
     if papers:
         cached_body = generate_markdown(papers, keywords, categories, days)
     else:
@@ -792,6 +904,7 @@ def build_cache_fallback_report(
             "",
             f"- Error type: {type(error).__name__}",
             f"- Error message: {error}",
+            f"- arXiv response sequence: {response_sequence}",
             f"- Cache created_at: {cached_created_at}",
             f"- Search window: last {days} days",
             f"- arXiv categories: {', '.join(categories)}",
