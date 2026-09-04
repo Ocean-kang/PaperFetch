@@ -1,10 +1,10 @@
 # PaperFetch
 
-> Fetch recent arXiv papers by category and keyword, then save or send a daily Markdown digest.
+> Fetch recent arXiv papers by category and topic, then save results or send a daily HTML digest.
 
 ## Overview
 
-PaperFetch is a lightweight Python utility for monitoring recent arXiv papers. It queries the arXiv API by category and keyword, filters papers within a recent time window, formats the matched papers into CSV or Markdown, and can send the result by email.
+PaperFetch is a lightweight Python utility for monitoring recent arXiv papers. It queries the arXiv API by category and topic keyword, filters papers within a recent time window, formats the matched papers into CSV, Markdown, or a mobile-friendly HTML email, and can send the result by email.
 
 This project is useful for researchers, students, and engineers who want a simple scheduled paper digest for topics such as computer vision, NLP, AI, or a custom research keyword.
 
@@ -12,7 +12,7 @@ This project is useful for researchers, students, and engineers who want a simpl
 
 * Query arXiv papers by category, keyword, and recent-day window.
 * Generate local CSV or Markdown paper digests.
-* Send daily Markdown digests by email through SMTP.
+* Send mobile-friendly HTML digests with a topic summary table through SMTP.
 * Support multiple arXiv categories such as `cs.CV`, `cs.CL`, and `cs.AI`.
 * Support scheduled server execution through `run.sh`.
 
@@ -135,18 +135,17 @@ Edit the constants at the top of `PaperFrech_daily_keyword.py`:
 
 ```python
 CATEGORIES = ["cs.CV", "cs.CL", "cs.AI"]
-KEYWORDS = [
-    "open vocabulary semantic segmentation",
-    "open-vocabulary semantic segmentation",
-    "vision-language alignment",
-    "unsupervised embedding alignment",
-    "unpaired image-text alignment",
-    "distribution matching",
-    "optimal transport alignment",
-]
-DAYS = 20
+TOPICS = {
+    "开放词汇分割": ["open vocabulary segmentation", "open-vocabulary segmentation"],
+    "视觉语言与多模态对齐": ["vision-language alignment", "multimodal alignment"],
+    "无监督与非配对对齐": ["unsupervised alignment", "unpaired alignment"],
+    "分布、几何与表征空间对齐": ["distribution matching", "optimal transport alignment"],
+}
+DAYS = 7
 MAX_RESULTS = 100
 ```
+
+`KEYWORDS` is derived automatically from `TOPICS`. The complete default keyword list is documented below.
 
 ### Step 3: Run the Digest Script
 
@@ -207,7 +206,7 @@ tail -200 /root/code/PaperFetch/log/run.log
 | ------ | ------- | ------ |
 | `PaperFetch.py` | Fetch recent arXiv papers for a single query/category setting | CSV file under `savefile/` |
 | `PaperFetch_daily.py` | Fetch recent papers from multiple categories, generate Markdown, and optionally send email | Markdown file under `savefile/`; email if enabled |
-| `PaperFrech_daily_keyword.py` | Fetch papers using one combined query, deduplicate, and send at most one Markdown digest email | Email digest |
+| `PaperFrech_daily_keyword.py` | Fetch papers using one combined query, deduplicate, and send at most one topic-grouped HTML digest email | HTML email digest |
 | `run.sh` | Server wrapper for scheduled execution of `PaperFrech_daily_keyword.py` | Log file under `log/run.log` |
 
 ## Command Line Arguments
@@ -216,7 +215,7 @@ tail -200 /root/code/PaperFetch/log/run.log
 
 | Argument | Type | Default | Description |
 | -------- | ---: | ------: | ----------- |
-| `--days` | int | `20` | Recent UTC days to query through `submittedDate`. |
+| `--days` | int | `7` | Recent UTC days to query through `submittedDate`. |
 | `--max-results` | int | `100` | Maximum arXiv results to request. Values above 100 are capped at 100. |
 | `--dry-run` | flag | off | Fetch, filter, and generate the report, but do not send email. |
 | `--no-email` | flag | off | Disable email sending for this run. |
@@ -255,28 +254,49 @@ In `PaperFrech_daily_keyword.py`:
 
 ```python
 CATEGORIES = ["cs.CV", "cs.CL", "cs.AI"]
-KEYWORDS = [
-    "open vocabulary semantic segmentation",
-    "open-vocabulary semantic segmentation",
-    "open vocabulary segmentation",
-    "open-vocabulary segmentation",
-    "vision-language alignment",
-    "image-text alignment",
-    "cross-modal alignment",
-    "multimodal alignment",
-    "unsupervised alignment",
-    "unsupervised embedding alignment",
-    "unpaired image-text alignment",
-    "distribution matching",
-    "embedding translator",
-    "vector space alignment",
-    "manifold alignment",
-    "optimal transport alignment",
-    "adversarial alignment",
-]
-DAYS = 20
+TOPICS = {
+    "开放词汇分割": [
+        "open vocabulary semantic segmentation",
+        "open-vocabulary semantic segmentation",
+        "open vocabulary segmentation",
+        "open-vocabulary segmentation",
+    ],
+    "视觉语言与多模态对齐": [
+        "vision-language alignment",
+        "vision language alignment",
+        "image-text alignment",
+        "image text alignment",
+        "cross-modal alignment",
+        "cross modal alignment",
+        "multimodal alignment",
+        "multi-modal alignment",
+    ],
+    "无监督与非配对对齐": [
+        "unsupervised alignment",
+        "unsupervised embedding alignment",
+        "unsupervised representation alignment",
+        "unsupervised cross-modal alignment",
+        "unpaired alignment",
+        "unpaired image-text alignment",
+        "unpaired vision-language alignment",
+        "unpaired multimodal alignment",
+    ],
+    "分布、几何与表征空间对齐": [
+        "distribution matching",
+        "embedding distribution alignment",
+        "embedding translation",
+        "embedding translator",
+        "vector space alignment",
+        "representation alignment",
+        "manifold alignment",
+        "optimal transport alignment",
+        "adversarial alignment",
+    ],
+}
+KEYWORDS = [keyword for topic_keywords in TOPICS.values() for keyword in topic_keywords]
+DAYS = 7
 MAX_RESULTS = 100
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT = (10, 60)
 SMTP_HOST = "smtp.qq.com"
 ```
 
@@ -285,7 +305,8 @@ Meaning:
 | Name | Type | Description |
 | ---- | ---- | ----------- |
 | `CATEGORIES` | list | arXiv categories to query |
-| `KEYWORDS` | list | Keywords or phrases to match in title/abstract. The default list uses OR matching across open-vocabulary segmentation, vision-language alignment, unsupervised/unpaired alignment, distribution matching, and related vector-space alignment topics. |
+| `TOPICS` | dict | Ordered Chinese topic names and their title/abstract matching keywords. A paper may match multiple topics. |
+| `KEYWORDS` | list | Automatically flattened search list derived from `TOPICS`; do not edit it separately. |
 | `DAYS` | int | Number of recent days to keep |
 | `MAX_RESULTS` | int | Maximum number of arXiv results requested for the combined query |
 | `REQUEST_TIMEOUT` | int | HTTP request timeout in seconds |
@@ -312,7 +333,7 @@ Output details:
 
 * `PaperFetch.py` writes CSV files to `savefile/`.
 * `PaperFetch_daily.py` writes Markdown reports to `savefile/`.
-* `PaperFrech_daily_keyword.py` sends the Markdown digest by email unless `--dry-run` or `--no-email` is used.
+* `PaperFrech_daily_keyword.py` sends an HTML digest with a topic summary table and one detail card per paper unless `--dry-run` or `--no-email` is used.
 * `PaperFrech_daily_keyword.py` writes a latest successful digest cache under `cache/` and can use it as a fallback if arXiv fails later.
 * `run.sh` appends runtime logs to `log/run.log`.
 * `cron.log` should only show whether cron invoked `run.sh`; the main execution detail is in `log/run.log`.
@@ -506,9 +527,9 @@ A: No. The current scripts fetch arXiv metadata such as title, authors, abstract
 
 A: No. It only performs API requests, text filtering, report generation, and email sending.
 
-**Q3: Where should I change the keywords?**
+**Q3: Where should I change the topics or keywords?**
 
-A: Edit `KEYWORDS` in `PaperFrech_daily_keyword.py`.
+A: Edit `TOPICS` in `PaperFrech_daily_keyword.py`. `KEYWORDS` is generated from it automatically.
 
 **Q4: Where should I change the arXiv categories?**
 
@@ -522,7 +543,7 @@ A: Yes. Use `run.sh` with cron after adjusting the absolute paths to match your 
 
 * [ ] Add a command-line interface for categories, keywords, days, and output options.
 * [ ] Add a checked-in `config/MyEmail.example.yaml`.
-* [ ] Add unit tests for URL construction, keyword matching, deduplication, and Markdown generation.
+* [x] Add unit tests for request construction, topic classification, and HTML digest generation.
 * [ ] Refactor duplicate logic from the three Python scripts into reusable modules.
 * [ ] Add optional local Markdown saving for `PaperFrech_daily_keyword.py`.
 

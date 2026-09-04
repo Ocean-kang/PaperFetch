@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import requests
+from lxml import html as lxml_html
 from requests import HTTPError, Timeout
 
 import PaperFrech_daily_keyword as paperfetch
@@ -469,6 +470,166 @@ class CacheFallbackMainTests(unittest.TestCase):
         )
         self.assertIn("skipped the arXiv request", report)
         self.assertNotIn("could not reach arXiv", report)
+
+
+class TopicDigestTests(unittest.TestCase):
+    @staticmethod
+    def paper(
+        arxiv_id: str,
+        title: str,
+        summary: str,
+        published: str,
+        link: str | None = None,
+    ):
+        return {
+            "arxiv_id": arxiv_id,
+            "title": title,
+            "authors": 'Alice & Bob <team@example.com>',
+            "summary": summary,
+            "published": published,
+            "category": "cs.CV, cs.AI",
+            "link": link or f"https://arxiv.org/abs/{arxiv_id}",
+        }
+
+    def test_topic_configuration_preserves_all_twenty_nine_keywords_in_order(self):
+        expected = [
+            "open vocabulary semantic segmentation",
+            "open-vocabulary semantic segmentation",
+            "open vocabulary segmentation",
+            "open-vocabulary segmentation",
+            "vision-language alignment",
+            "vision language alignment",
+            "image-text alignment",
+            "image text alignment",
+            "cross-modal alignment",
+            "cross modal alignment",
+            "multimodal alignment",
+            "multi-modal alignment",
+            "unsupervised alignment",
+            "unsupervised embedding alignment",
+            "unsupervised representation alignment",
+            "unsupervised cross-modal alignment",
+            "unpaired alignment",
+            "unpaired image-text alignment",
+            "unpaired vision-language alignment",
+            "unpaired multimodal alignment",
+            "distribution matching",
+            "embedding distribution alignment",
+            "embedding translation",
+            "embedding translator",
+            "vector space alignment",
+            "representation alignment",
+            "manifold alignment",
+            "optimal transport alignment",
+            "adversarial alignment",
+        ]
+
+        self.assertEqual(paperfetch.KEYWORDS, expected)
+        self.assertEqual(len(paperfetch.TOPICS), 4)
+
+    def test_matching_topics_supports_single_multiple_and_no_match(self):
+        single = self.paper("1", "An open-vocabulary segmentation method", "", "2026-09-01")
+        multiple = self.paper(
+            "2",
+            "Open vocabulary segmentation with vision-language alignment",
+            "Uses optimal transport alignment.",
+            "2026-09-02",
+        )
+        unmatched = self.paper("3", "A general machine learning paper", "No configured terms.", "2026-09-03")
+
+        self.assertEqual(paperfetch.matching_topics(single), ["开放词汇分割"])
+        self.assertEqual(
+            paperfetch.matching_topics(multiple),
+            ["开放词汇分割", "视觉语言与多模态对齐", "分布、几何与表征空间对齐"],
+        )
+        self.assertEqual(paperfetch.matching_topics(unmatched), [])
+
+        grouped = paperfetch.group_papers_by_topic([single, multiple, unmatched])
+        self.assertEqual(len(grouped["开放词汇分割"]), 2)
+        self.assertEqual(grouped["未分类"], [unmatched])
+
+    def test_html_has_complete_summary_safe_content_and_unique_sorted_details(self):
+        older = self.paper(
+            "old&1",
+            '<Open vocabulary segmentation & vision-language alignment>',
+            '<script>alert("unsafe")</script>',
+            "2026-09-01",
+            "https://arxiv.org/abs/old?x=1&y=2",
+        )
+        newer = self.paper(
+            "new-2",
+            "Optimal transport alignment for model spaces",
+            "A newer paper.",
+            "2026-09-03",
+        )
+
+        report = paperfetch.generate_email_html(
+            [older, newer],
+            paperfetch.KEYWORDS,
+            paperfetch.CATEGORIES,
+            7,
+        )
+        document = lxml_html.fromstring(report)
+        rows = document.xpath("//table[@id='topic-summary']/tbody/tr")
+        row_by_topic = {row.get("data-topic"): row for row in rows}
+
+        self.assertTrue(report.lower().startswith("<!doctype html>"))
+        self.assertEqual(list(row_by_topic), list(paperfetch.TOPICS))
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(
+            row_by_topic["开放词汇分割"].xpath(".//td[contains(@class, 'topic-count')]")[0].text_content().strip(),
+            "1",
+        )
+        self.assertEqual(
+            row_by_topic["视觉语言与多模态对齐"].xpath(".//td[contains(@class, 'topic-count')]")[0].text_content().strip(),
+            "1",
+        )
+        self.assertIn("No matching papers", row_by_topic["无监督与非配对对齐"].text_content())
+        self.assertEqual(report.count("&lt;script&gt;"), 1)
+        self.assertNotIn("<script>alert", report)
+        self.assertIn("Alice &amp; Bob &lt;team@example.com&gt;", report)
+
+        detail_ids = document.xpath("//table[contains(@class, 'paper-detail')]/@data-arxiv-id")
+        self.assertEqual(detail_ids, ["new-2", "old&1"])
+        self.assertEqual(detail_ids.count("old&1"), 1)
+        self.assertEqual(
+            len(document.xpath("//a[@href='https://arxiv.org/abs/old?x=1&y=2']")),
+            3,
+        )
+
+    def test_unclassified_summary_row_only_appears_when_needed(self):
+        unmatched = self.paper("3", "A general machine learning paper", "No configured terms.", "2026-09-03")
+        report = paperfetch.generate_email_html(
+            [unmatched],
+            paperfetch.KEYWORDS,
+            paperfetch.CATEGORIES,
+            7,
+        )
+        document = lxml_html.fromstring(report)
+        topics = document.xpath("//table[@id='topic-summary']/tbody/tr/@data-topic")
+
+        self.assertEqual(topics, [*paperfetch.TOPICS, "未分类"])
+
+    def test_cached_papers_use_html_digest_with_warning_banner(self):
+        cached_paper = self.paper(
+            "cached-1",
+            "Vision-language alignment from cache",
+            "Cached abstract.",
+            "2026-09-01",
+        )
+        report = paperfetch.build_cache_fallback_report(
+            paperfetch.ArxivServiceBusyError("busy", [503, 429]),
+            {"created_at": "2026-09-02T01:00:00+00:00", "papers": [cached_paper]},
+            paperfetch.KEYWORDS,
+            paperfetch.CATEGORIES,
+            7,
+        )
+
+        self.assertTrue(report.lower().startswith("<!doctype html>"))
+        self.assertIn("Cached results:", report)
+        self.assertIn("503 -&gt; 429", report)
+        self.assertIn('id="topic-summary"', report)
+        self.assertIn("Vision-language alignment from cache", report)
 
 
 if __name__ == "__main__":

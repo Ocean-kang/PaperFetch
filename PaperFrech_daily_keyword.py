@@ -1,11 +1,12 @@
 """
-Fetch recent arXiv papers by keyword/category and send one daily Markdown digest.
+Fetch recent arXiv papers by topic/category and send one daily HTML digest.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import logging
 import os
@@ -25,44 +26,46 @@ EMAIL_CONFIG = CONFIG_DIR / "MyEmail.yaml"
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
 
 CATEGORIES = ["cs.CV", "cs.CL", "cs.AI"]
-KEYWORDS = [
-    # open-vocabulary segmentation
-    "open vocabulary semantic segmentation",
-    "open-vocabulary semantic segmentation",
-    "open vocabulary segmentation",
-    "open-vocabulary segmentation",
-
-    # vision-language / multimodal alignment
-    "vision-language alignment",
-    "vision language alignment",
-    "image-text alignment",
-    "image text alignment",
-    "cross-modal alignment",
-    "cross modal alignment",
-    "multimodal alignment",
-    "multi-modal alignment",
-
-    # unsupervised / unpaired alignment
-    "unsupervised alignment",
-    "unsupervised embedding alignment",
-    "unsupervised representation alignment",
-    "unsupervised cross-modal alignment",
-    "unpaired alignment",
-    "unpaired image-text alignment",
-    "unpaired vision-language alignment",
-    "unpaired multimodal alignment",
-
-    # distribution / geometry / translator
-    "distribution matching",
-    "embedding distribution alignment",
-    "embedding translation",
-    "embedding translator",
-    "vector space alignment",
-    "representation alignment",
-    "manifold alignment",
-    "optimal transport alignment",
-    "adversarial alignment",
-]
+TOPICS = {
+    "开放词汇分割": [
+        "open vocabulary semantic segmentation",
+        "open-vocabulary semantic segmentation",
+        "open vocabulary segmentation",
+        "open-vocabulary segmentation",
+    ],
+    "视觉语言与多模态对齐": [
+        "vision-language alignment",
+        "vision language alignment",
+        "image-text alignment",
+        "image text alignment",
+        "cross-modal alignment",
+        "cross modal alignment",
+        "multimodal alignment",
+        "multi-modal alignment",
+    ],
+    "无监督与非配对对齐": [
+        "unsupervised alignment",
+        "unsupervised embedding alignment",
+        "unsupervised representation alignment",
+        "unsupervised cross-modal alignment",
+        "unpaired alignment",
+        "unpaired image-text alignment",
+        "unpaired vision-language alignment",
+        "unpaired multimodal alignment",
+    ],
+    "分布、几何与表征空间对齐": [
+        "distribution matching",
+        "embedding distribution alignment",
+        "embedding translation",
+        "embedding translator",
+        "vector space alignment",
+        "representation alignment",
+        "manifold alignment",
+        "optimal transport alignment",
+        "adversarial alignment",
+    ],
+}
+KEYWORDS = [keyword for topic_keywords in TOPICS.values() for keyword in topic_keywords]
 DAYS = 7
 MAX_RESULTS = 100
 REQUEST_TIMEOUT = (10, 60)
@@ -631,6 +634,47 @@ def keyword_match(entry: Any, keywords: list[str]) -> bool:
     return any(keyword_in_text(text, keyword) for keyword in keywords)
 
 
+def matching_topics(
+    paper: dict[str, Any],
+    topics: dict[str, list[str]] | None = None,
+) -> list[str]:
+    configured_topics = TOPICS if topics is None else topics
+    text = f"{paper.get('title', '')} {paper.get('summary', '')}"
+    return [
+        topic_name
+        for topic_name, topic_keywords in configured_topics.items()
+        if any(keyword_in_text(text, keyword) for keyword in topic_keywords)
+    ]
+
+
+def group_papers_by_topic(
+    papers: list[dict[str, Any]],
+    topics: dict[str, list[str]] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    configured_topics = TOPICS if topics is None else topics
+    grouped = {topic_name: [] for topic_name in configured_topics}
+    unclassified = []
+
+    for paper in papers:
+        paper_topics = matching_topics(paper, configured_topics)
+        if not paper_topics:
+            unclassified.append(paper)
+            continue
+        for topic_name in paper_topics:
+            grouped[topic_name].append(paper)
+
+    if unclassified:
+        grouped["未分类"] = unclassified
+    return grouped
+
+
+def safe_html_url(value: Any) -> str:
+    candidate = str(value or "").strip()
+    if not re.match(r"^https?://", candidate, flags=re.IGNORECASE):
+        return "#"
+    return html.escape(candidate, quote=True)
+
+
 def entry_recent_time(entry: Any) -> datetime | None:
     candidates = []
     for key in ("published", "updated"):
@@ -882,7 +926,29 @@ def build_cache_fallback_report(
     request_summary, _ = arxiv_failure_context(error)
     response_sequence = arxiv_response_sequence(error) or "not available"
     if papers:
-        cached_body = generate_markdown(papers, keywords, categories, days)
+        notice_html = "".join(
+            [
+                '<div style="margin:0 0 20px;padding:14px 16px;border:1px solid #f2c46d;',
+                'border-radius:8px;background:#fff7e6;color:#6b4600;font-size:14px;line-height:1.6;">',
+                "<strong>Cached results:</strong> ",
+                html.escape(request_summary),
+                " These papers are not from a fresh arXiv request today.<br>",
+                f"<strong>Error:</strong> {html.escape(str(error))}<br>",
+                f"<strong>arXiv response sequence:</strong> {html.escape(response_sequence)}<br>",
+                f"<strong>Cache created_at:</strong> {html.escape(str(cached_created_at))}<br>",
+                f"<strong>Cached paper count:</strong> {len(papers)}<br>",
+                f"<strong>Run time:</strong> {html.escape(run_time)}",
+                "</div>",
+            ]
+        )
+        return generate_email_html(
+            papers,
+            keywords,
+            categories,
+            days,
+            heading="PaperFetch Cached Digest",
+            notice_html=notice_html,
+        )
     else:
         cached_body = "\n".join(
             [
@@ -919,19 +985,145 @@ def build_cache_fallback_report(
     return f"{header}\n{cached_body}"
 
 
-def generate_markdown(papers: list[dict[str, Any]], keywords: list[str], categories: list[str], days: int) -> str:
+def generate_email_html(
+    papers: list[dict[str, Any]],
+    keywords: list[str],
+    categories: list[str],
+    days: int,
+    heading: str = "Daily arXiv Digest",
+    notice_html: str = "",
+) -> str:
     if not papers:
         return build_empty_report(keywords, categories, days)
 
-    lines = ["# Daily arXiv Digest\n"]
-    for index, paper in enumerate(papers, 1):
-        lines.append(f"### {index}. [{paper['title']}]({paper['link']})")
-        lines.append(f"- **arXiv ID:** `{paper['arxiv_id']}`")
-        lines.append(f"- **Authors:** {paper['authors']}")
-        lines.append(f"- **Category:** `{paper['category']}`")
-        lines.append(f"- **Published:** {paper['published']}\n")
-        lines.append(f"{paper['summary']}\n")
-    return "\n".join(lines)
+    ordered_papers = sorted(
+        papers,
+        key=lambda item: str(item.get("published", "")),
+        reverse=True,
+    )
+    grouped_papers = group_papers_by_topic(ordered_papers)
+
+    summary_rows = []
+    for topic_name, topic_papers in grouped_papers.items():
+        if topic_papers:
+            title_items = "".join(
+                '<li style="margin:0 0 7px;padding:0;line-height:1.45;">'
+                f'<a class="topic-title-link" href="{safe_html_url(paper.get("link"))}" '
+                'style="color:#1558b0;text-decoration:none;overflow-wrap:anywhere;'
+                'word-break:break-word;">'
+                f'{html.escape(str(paper.get("title", "Untitled")))}</a></li>'
+                for paper in topic_papers
+            )
+            paper_titles = f'<ol style="margin:0;padding-left:20px;">{title_items}</ol>'
+        else:
+            paper_titles = '<span style="color:#7a8492;">No matching papers</span>'
+
+        summary_rows.append(
+            "".join(
+                [
+                    f'<tr data-topic="{html.escape(topic_name, quote=True)}">',
+                    '<th scope="row" style="padding:12px 10px;border:1px solid #dce3eb;',
+                    'background:#f8fafc;text-align:left;vertical-align:top;font-size:14px;',
+                    'line-height:1.45;overflow-wrap:anywhere;word-break:break-word;">',
+                    html.escape(topic_name),
+                    "</th>",
+                    '<td class="topic-count" style="padding:12px 6px;border:1px solid #dce3eb;',
+                    'text-align:center;vertical-align:top;font-size:14px;">',
+                    str(len(topic_papers)),
+                    "</td>",
+                    '<td style="padding:12px 10px;border:1px solid #dce3eb;vertical-align:top;',
+                    'font-size:14px;line-height:1.45;overflow-wrap:anywhere;'
+                    'word-break:break-word;">',
+                    paper_titles,
+                    "</td></tr>",
+                ]
+            )
+        )
+
+    detail_cards = []
+    for index, paper in enumerate(ordered_papers, 1):
+        paper_topics = matching_topics(paper) or ["未分类"]
+        topic_badges = " ".join(
+            '<span style="display:inline-block;margin:0 5px 5px 0;padding:3px 8px;'
+            'border-radius:12px;background:#e9f2ff;color:#174b87;font-size:12px;">'
+            f"{html.escape(topic_name)}</span>"
+            for topic_name in paper_topics
+        )
+        raw_arxiv_id = str(paper.get("arxiv_id", ""))
+        detail_cards.append(
+            "".join(
+                [
+                    '<table role="presentation" class="paper-detail" ',
+                    f'data-arxiv-id="{html.escape(raw_arxiv_id, quote=True)}" ',
+                    'width="100%" cellspacing="0" cellpadding="0" style="width:100%;',
+                    'margin:0 0 16px;border:1px solid #dce3eb;border-radius:8px;',
+                    'background:#ffffff;table-layout:fixed;"><tr><td style="padding:16px;'
+                    'overflow-wrap:anywhere;word-break:break-word;">',
+                    '<div style="margin:0 0 8px;color:#172033;font-size:18px;font-weight:700;',
+                    'line-height:1.4;">',
+                    f'{index}. <a class="paper-title-link" '
+                    f'href="{safe_html_url(paper.get("link"))}" '
+                    'style="color:#1558b0;text-decoration:none;overflow-wrap:anywhere;'
+                    'word-break:break-word;">',
+                    html.escape(str(paper.get("title", "Untitled"))),
+                    "</a></div>",
+                    f'<div style="margin:0 0 8px;">{topic_badges}</div>',
+                    '<div style="margin:0 0 10px;color:#5b6573;font-size:13px;line-height:1.6;">',
+                    f"<strong>arXiv ID:</strong> {html.escape(raw_arxiv_id)}<br>",
+                    f'<strong>Authors:</strong> {html.escape(str(paper.get("authors", "")))}<br>',
+                    f'<strong>Category:</strong> {html.escape(str(paper.get("category", "")))}<br>',
+                    f'<strong>Published:</strong> {html.escape(str(paper.get("published", "")))}',
+                    "</div>",
+                    '<div style="color:#2f3742;font-size:14px;line-height:1.65;">',
+                    html.escape(str(paper.get("summary", ""))),
+                    "</div></td></tr></table>",
+                ]
+            )
+        )
+
+    category_text = html.escape(", ".join(categories))
+    return "".join(
+        [
+            "<!doctype html><html><head>",
+            '<meta charset="utf-8"><meta name="viewport" '
+            'content="width=device-width,initial-scale=1">',
+            '<style>@media only screen and (max-width:480px){'
+            '.email-shell{padding:8px 4px!important}.email-content{padding:16px 10px!important}'
+            '}</style>',
+            f"<title>{html.escape(heading)}</title></head>",
+            '<body style="margin:0;padding:0;background:#f3f6fa;'
+            'font-family:Arial,Helvetica,sans-serif;color:#172033;">',
+            '<div style="display:none;max-height:0;overflow:hidden;">',
+            f"{len(ordered_papers)} papers across {len(TOPICS)} research topics.</div>",
+            '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" '
+            'style="width:100%;background:#f3f6fa;"><tr><td align="center" '
+            'class="email-shell" style="padding:16px 8px;">',
+            '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" '
+            'style="width:100%;max-width:760px;background:#ffffff;border-radius:10px;">',
+            '<tr><td class="email-content" style="padding:22px 18px;">',
+            f'<h1 style="margin:0 0 8px;font-size:24px;line-height:1.3;">'
+            f"{html.escape(heading)}</h1>",
+            '<p style="margin:0 0 20px;color:#5b6573;font-size:14px;line-height:1.5;">',
+            f"Last {days} days &middot; {len(ordered_papers)} papers &middot; "
+            f"{category_text}</p>",
+            notice_html,
+            '<h2 style="margin:0 0 10px;font-size:19px;line-height:1.4;">Topic Summary</h2>',
+            '<table id="topic-summary" width="100%" cellspacing="0" cellpadding="0" '
+            'style="width:100%;table-layout:fixed;border-collapse:collapse;margin:0 0 24px;">',
+            '<colgroup><col style="width:26%;"><col style="width:13%;">'
+            '<col style="width:61%;"></colgroup>',
+            '<thead><tr><th style="padding:10px;border:1px solid #cbd5e1;'
+            'background:#eaf0f7;text-align:left;font-size:13px;">Topic</th>',
+            '<th style="padding:10px 4px;border:1px solid #cbd5e1;'
+            'background:#eaf0f7;text-align:center;font-size:13px;">Count</th>',
+            '<th style="padding:10px;border:1px solid #cbd5e1;'
+            'background:#eaf0f7;text-align:left;font-size:13px;">Papers</th></tr></thead>',
+            f"<tbody>{''.join(summary_rows)}</tbody></table>",
+            '<h2 style="margin:0 0 12px;font-size:19px;line-height:1.4;">Paper Details</h2>',
+            "".join(detail_cards),
+            "</td></tr></table></td></tr></table></body></html>",
+        ]
+    )
 
 
 def load_email_config() -> Any:
@@ -947,7 +1139,7 @@ def load_email_config() -> Any:
     return cfg
 
 
-def send_email(subject: str, markdown_content: str) -> None:
+def send_email(subject: str, content: str) -> None:
     import yagmail
 
     cfg = load_email_config()
@@ -958,7 +1150,7 @@ def send_email(subject: str, markdown_content: str) -> None:
         port=SMTP_PORT,
         smtp_ssl=True,
     )
-    yag.send(to=cfg.receiver_email, subject=subject, contents=[markdown_content])
+    yag.send(to=cfg.receiver_email, subject=subject, contents=[content])
     LOGGER.info("email sent to %s", cfg.receiver_email)
 
 
@@ -1045,7 +1237,7 @@ def main() -> int:
     if not papers:
         LOGGER.info("No matched papers found, sending empty report email.")
 
-    report = generate_markdown(papers, keywords, categories, args.days)
+    report = generate_email_html(papers, keywords, categories, args.days)
     subject = build_email_subject(papers, args.days)
     LOGGER.info("send_email=%s dry_run=%s no_email=%s", should_send_email, args.dry_run, args.no_email)
 
