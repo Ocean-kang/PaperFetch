@@ -137,7 +137,8 @@ Edit the constants at the top of `PaperFrech_daily_keyword.py`:
 CATEGORIES = ["cs.CV", "cs.CL", "cs.AI"]
 TOPICS = {
     "开放词汇分割": ["open vocabulary segmentation", "open-vocabulary segmentation"],
-    "视觉语言与多模态对齐": ["vision-language alignment", "multimodal alignment"],
+    "视觉语言对齐": ["vision-language alignment", "image-text alignment"],
+    "多模态对齐": ["cross-modal alignment", "multimodal alignment"],
     "无监督与非配对对齐": ["unsupervised alignment", "unpaired alignment"],
     "分布、几何与表征空间对齐": ["distribution matching", "optimal transport alignment"],
 }
@@ -261,11 +262,13 @@ TOPICS = {
         "open vocabulary segmentation",
         "open-vocabulary segmentation",
     ],
-    "视觉语言与多模态对齐": [
+    "视觉语言对齐": [
         "vision-language alignment",
         "vision language alignment",
         "image-text alignment",
         "image text alignment",
+    ],
+    "多模态对齐": [
         "cross-modal alignment",
         "cross modal alignment",
         "multimodal alignment",
@@ -334,6 +337,7 @@ Output details:
 * `PaperFetch.py` writes CSV files to `savefile/`.
 * `PaperFetch_daily.py` writes Markdown reports to `savefile/`.
 * `PaperFrech_daily_keyword.py` sends an HTML digest with a topic summary table and one detail card per paper unless `--dry-run` or `--no-email` is used.
+  On screens up to 480 pixels wide, each topic summary row becomes a full-width card with the topic, count, and paper list stacked vertically.
 * `PaperFrech_daily_keyword.py` writes a latest successful digest cache under `cache/` and can use it as a fallback if arXiv fails later.
 * `run.sh` appends runtime logs to `log/run.log`.
 * `cron.log` should only show whether cron invoked `run.sh`; the main execution detail is in `log/run.log`.

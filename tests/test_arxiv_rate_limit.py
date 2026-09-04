@@ -525,7 +525,7 @@ class TopicDigestTests(unittest.TestCase):
         ]
 
         self.assertEqual(paperfetch.KEYWORDS, expected)
-        self.assertEqual(len(paperfetch.TOPICS), 4)
+        self.assertEqual(len(paperfetch.TOPICS), 5)
 
     def test_matching_topics_supports_single_multiple_and_no_match(self):
         single = self.paper("1", "An open-vocabulary segmentation method", "", "2026-09-01")
@@ -540,9 +540,20 @@ class TopicDigestTests(unittest.TestCase):
         self.assertEqual(paperfetch.matching_topics(single), ["开放词汇分割"])
         self.assertEqual(
             paperfetch.matching_topics(multiple),
-            ["开放词汇分割", "视觉语言与多模态对齐", "分布、几何与表征空间对齐"],
+            ["开放词汇分割", "视觉语言对齐", "分布、几何与表征空间对齐"],
         )
         self.assertEqual(paperfetch.matching_topics(unmatched), [])
+
+        multimodal = self.paper(
+            "4",
+            "Unpaired multimodal alignment for heterogeneous encoders",
+            "A cross-modal alignment method.",
+            "2026-09-04",
+        )
+        self.assertEqual(
+            paperfetch.matching_topics(multimodal),
+            ["多模态对齐", "无监督与非配对对齐"],
+        )
 
         grouped = paperfetch.group_papers_by_topic([single, multiple, unmatched])
         self.assertEqual(len(grouped["开放词汇分割"]), 2)
@@ -575,16 +586,30 @@ class TopicDigestTests(unittest.TestCase):
 
         self.assertTrue(report.lower().startswith("<!doctype html>"))
         self.assertEqual(list(row_by_topic), list(paperfetch.TOPICS))
-        self.assertEqual(len(rows), 4)
+        self.assertEqual(len(rows), 5)
         self.assertEqual(
             row_by_topic["开放词汇分割"].xpath(".//td[contains(@class, 'topic-count')]")[0].text_content().strip(),
             "1",
         )
         self.assertEqual(
-            row_by_topic["视觉语言与多模态对齐"].xpath(".//td[contains(@class, 'topic-count')]")[0].text_content().strip(),
+            row_by_topic["视觉语言对齐"].xpath(".//td[contains(@class, 'topic-count')]")[0].text_content().strip(),
             "1",
         )
+        self.assertIn("No matching papers", row_by_topic["多模态对齐"].text_content())
         self.assertIn("No matching papers", row_by_topic["无监督与非配对对齐"].text_content())
+        self.assertEqual(
+            document.xpath("//meta[@name='viewport']/@content"),
+            ["width=device-width,initial-scale=1"],
+        )
+        self.assertEqual(len(document.xpath("//tr[contains(@class, 'topic-summary-row')]")), 5)
+        self.assertEqual(len(document.xpath("//span[contains(@class, 'mobile-count-label')]")), 5)
+        self.assertEqual(len(document.xpath("//ol[contains(@class, 'topic-paper-list')]")), 3)
+        styles = " ".join(document.xpath("//style/text()"))
+        self.assertIn("@media only screen and (max-width:480px)", styles)
+        self.assertIn("#topic-summary .topic-summary-row", styles)
+        self.assertIn("#topic-summary .topic-count", styles)
+        self.assertIn("display:none!important", styles)
+        self.assertIn("#topic-summary .mobile-count-label{display:block!important", styles)
         self.assertEqual(report.count("&lt;script&gt;"), 1)
         self.assertNotIn("<script>alert", report)
         self.assertIn("Alice &amp; Bob &lt;team@example.com&gt;", report)

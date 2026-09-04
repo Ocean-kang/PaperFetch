@@ -33,11 +33,13 @@ TOPICS = {
         "open vocabulary segmentation",
         "open-vocabulary segmentation",
     ],
-    "视觉语言与多模态对齐": [
+    "视觉语言对齐": [
         "vision-language alignment",
         "vision language alignment",
         "image-text alignment",
         "image text alignment",
+    ],
+    "多模态对齐": [
         "cross-modal alignment",
         "cross modal alignment",
         "multimodal alignment",
@@ -1014,24 +1016,32 @@ def generate_email_html(
                 f'{html.escape(str(paper.get("title", "Untitled")))}</a></li>'
                 for paper in topic_papers
             )
-            paper_titles = f'<ol style="margin:0;padding-left:20px;">{title_items}</ol>'
+            paper_titles = (
+                f'<ol class="topic-paper-list" style="margin:0;padding-left:20px;">'
+                f"{title_items}</ol>"
+            )
         else:
             paper_titles = '<span style="color:#7a8492;">No matching papers</span>'
 
         summary_rows.append(
             "".join(
                 [
-                    f'<tr data-topic="{html.escape(topic_name, quote=True)}">',
-                    '<th scope="row" style="padding:12px 10px;border:1px solid #dce3eb;',
+                    f'<tr class="topic-summary-row" data-topic="{html.escape(topic_name, quote=True)}">',
+                    '<th scope="row" class="topic-name" style="padding:12px 10px;',
+                    'border:1px solid #dce3eb;',
                     'background:#f8fafc;text-align:left;vertical-align:top;font-size:14px;',
                     'line-height:1.45;overflow-wrap:anywhere;word-break:break-word;">',
                     html.escape(topic_name),
+                    '<span class="mobile-count-label" style="display:none;">',
+                    f"Count: {len(topic_papers)}",
+                    "</span>",
                     "</th>",
                     '<td class="topic-count" style="padding:12px 6px;border:1px solid #dce3eb;',
                     'text-align:center;vertical-align:top;font-size:14px;">',
                     str(len(topic_papers)),
                     "</td>",
-                    '<td style="padding:12px 10px;border:1px solid #dce3eb;vertical-align:top;',
+                    '<td class="topic-papers" style="padding:12px 10px;border:1px solid #dce3eb;',
+                    'vertical-align:top;',
                     'font-size:14px;line-height:1.45;overflow-wrap:anywhere;'
                     'word-break:break-word;">',
                     paper_titles,
@@ -1089,6 +1099,25 @@ def generate_email_html(
             'content="width=device-width,initial-scale=1">',
             '<style>@media only screen and (max-width:480px){'
             '.email-shell{padding:8px 4px!important}.email-content{padding:16px 10px!important}'
+            '#topic-summary{display:block!important;width:100%!important;table-layout:auto!important;'
+            'border-collapse:separate!important;margin-bottom:20px!important}'
+            '#topic-summary .topic-summary-columns,#topic-summary .topic-summary-head{display:none!important}'
+            '#topic-summary .topic-summary-body{display:block!important;width:100%!important}'
+            '#topic-summary .topic-summary-row{display:block!important;width:100%!important;'
+            'box-sizing:border-box!important;margin:0 0 12px!important;border:1px solid #dce3eb!important;'
+            'border-radius:8px!important;overflow:hidden!important;background:#ffffff!important}'
+            '#topic-summary .topic-name,#topic-summary .topic-count,#topic-summary .topic-papers{'
+            'display:block!important;width:100%!important;box-sizing:border-box!important;'
+            'border:0!important;text-align:left!important}'
+            '#topic-summary .topic-name{padding:12px!important;background:#eef4fb!important;'
+            'font-size:15px!important;line-height:1.45!important}'
+            '#topic-summary .topic-count{padding:9px 12px 0!important;color:#5b6573!important;'
+            'font-size:13px!important;line-height:1.4!important;display:none!important}'
+            '#topic-summary .topic-papers{padding:9px 12px 12px!important;font-size:15px!important;'
+            'line-height:1.55!important;overflow-wrap:anywhere!important;word-break:break-word!important}'
+            '#topic-summary .topic-paper-list{margin:0!important;padding-left:20px!important}'
+            '#topic-summary .mobile-count-label{display:block!important;margin-top:4px!important;'
+            'color:#5b6573!important;font-size:13px!important;font-weight:400!important}'
             '}</style>',
             f"<title>{html.escape(heading)}</title></head>",
             '<body style="margin:0;padding:0;background:#f3f6fa;'
@@ -1108,17 +1137,18 @@ def generate_email_html(
             f"{category_text}</p>",
             notice_html,
             '<h2 style="margin:0 0 10px;font-size:19px;line-height:1.4;">Topic Summary</h2>',
-            '<table id="topic-summary" width="100%" cellspacing="0" cellpadding="0" '
+            '<table id="topic-summary" class="topic-summary-table" width="100%" cellspacing="0" '
+            'cellpadding="0" '
             'style="width:100%;table-layout:fixed;border-collapse:collapse;margin:0 0 24px;">',
-            '<colgroup><col style="width:26%;"><col style="width:13%;">'
+            '<colgroup class="topic-summary-columns"><col style="width:26%;"><col style="width:13%;">'
             '<col style="width:61%;"></colgroup>',
-            '<thead><tr><th style="padding:10px;border:1px solid #cbd5e1;'
+            '<thead class="topic-summary-head"><tr><th style="padding:10px;border:1px solid #cbd5e1;'
             'background:#eaf0f7;text-align:left;font-size:13px;">Topic</th>',
             '<th style="padding:10px 4px;border:1px solid #cbd5e1;'
             'background:#eaf0f7;text-align:center;font-size:13px;">Count</th>',
             '<th style="padding:10px;border:1px solid #cbd5e1;'
             'background:#eaf0f7;text-align:left;font-size:13px;">Papers</th></tr></thead>',
-            f"<tbody>{''.join(summary_rows)}</tbody></table>",
+            f'<tbody class="topic-summary-body">{"".join(summary_rows)}</tbody></table>',
             '<h2 style="margin:0 0 12px;font-size:19px;line-height:1.4;">Paper Details</h2>',
             "".join(detail_cards),
             "</td></tr></table></td></tr></table></body></html>",
