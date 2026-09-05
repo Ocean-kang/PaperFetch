@@ -581,59 +581,91 @@ class TopicDigestTests(unittest.TestCase):
             7,
         )
         document = lxml_html.fromstring(report)
-        rows = document.xpath("//table[@id='topic-summary']/tbody/tr")
-        row_by_topic = {row.get("data-topic"): row for row in rows}
-
-        self.assertTrue(report.lower().startswith("<!doctype html>"))
-        self.assertEqual(list(row_by_topic), list(paperfetch.TOPICS))
-        self.assertEqual(len(rows), 5)
-        self.assertEqual(
-            row_by_topic["开放词汇分割"].xpath(".//td[contains(@class, 'topic-count')]")[0].text_content().strip(),
-            "1",
-        )
-        self.assertEqual(
-            row_by_topic["视觉语言对齐"].xpath(".//td[contains(@class, 'topic-count')]")[0].text_content().strip(),
-            "1",
-        )
-        self.assertIn("No matching papers", row_by_topic["多模态对齐"].text_content())
-        self.assertIn("No matching papers", row_by_topic["无监督与非配对对齐"].text_content())
-        self.assertEqual(
-            document.xpath("//meta[@name='viewport']/@content"),
-            ["width=device-width,initial-scale=1"],
-        )
-        self.assertEqual(len(document.xpath("//tr[contains(@class, 'topic-summary-row')]")), 5)
-        self.assertEqual(len(document.xpath("//span[contains(@class, 'mobile-count-label')]")), 5)
-        self.assertEqual(len(document.xpath("//ol[contains(@class, 'topic-paper-list')]")), 3)
-        styles = " ".join(document.xpath("//style/text()"))
-        self.assertIn("@media only screen and (max-width:480px)", styles)
-        self.assertIn("#topic-summary .topic-summary-row", styles)
-        self.assertIn("#topic-summary .topic-count", styles)
-        self.assertIn("display:none!important", styles)
-        self.assertIn("#topic-summary .mobile-count-label{display:block!important", styles)
+        overview = document.get_element_by_id("topic-summary")
+        groups = overview.xpath(".//div[@class='topic-summary-group']")
+        self.assertEqual([group.get("data-topic") for group in groups],
+                         ["开放词汇分割", "视觉语言对齐", "分布、几何与表征空间对齐"])
+        self.assertEqual(overview.xpath(".//span[@class='summary-topic-count']/text()"), ["（1 篇）"] * 3)
+        for group, paper in zip(groups, [older, older, newer]):
+            links = group.xpath(".//a[@class='topic-title-link']")
+            self.assertEqual([link.text_content() for link in links], [paper["title"]])
+            self.assertEqual([link.get("href") for link in links], [paper["link"]])
+        self.assertLess(report.index('id="topic-summary"'), report.index('id="topic-sections"'))
+        sections = document.xpath("//div[@class='topic-section']")
+        self.assertEqual([section.get("data-topic") for section in sections],
+                         ["开放词汇分割", "视觉语言对齐", "分布、几何与表征空间对齐"])
+        self.assertEqual([section.xpath(".//span[@class='topic-count']/text()")[0]
+                          for section in sections], ["(1 papers)"] * 3)
+        self.assertIn("多模态对齐", document.get_element_by_id("empty-topics").text_content())
+        self.assertIn("无监督与非配对对齐", document.get_element_by_id("empty-topics").text_content())
+        self.assertEqual(len(document.xpath("//div[@class='shared-topic-note'] | //p[@class='shared-topic-note']")), 1)
+        self.assertFalse(document.xpath("//table[@id='topic-summary'] | //script"))
+        self.assertEqual(document.xpath("//meta[@name='viewport']/@content"),
+                         ["width=device-width,initial-scale=1"])
         self.assertEqual(report.count("&lt;script&gt;"), 1)
-        self.assertNotIn("<script>alert", report)
         self.assertIn("Alice &amp; Bob &lt;team@example.com&gt;", report)
+        cards = document.xpath("//div[@class='paper-detail']")
+        self.assertEqual([card.get("data-arxiv-id") for card in cards], ["old&1", "new-2"])
+        for card, paper in zip(cards, [older, newer]):
+            self.assertEqual(card.xpath(".//a[@class='paper-title-link']")[0].text_content(), paper["title"])
+            self.assertEqual(card.xpath(".//div[@class='paper-abstract']")[0].text_content(), paper["summary"])
+            self.assertEqual(card.xpath(".//a[@class='paper-original-link']/@href"), [paper["link"]])
+        self.assertIn("视觉语言对齐", cards[0].xpath(".//p[@class='paper-topics']")[0].text_content())
+        self.assertEqual(cards[0].xpath(".//a[@class='paper-pdf-link']/@href"), ["https://arxiv.org/pdf/old"])
 
-        detail_ids = document.xpath("//table[contains(@class, 'paper-detail')]/@data-arxiv-id")
-        self.assertEqual(detail_ids, ["new-2", "old&1"])
-        self.assertEqual(detail_ids.count("old&1"), 1)
-        self.assertEqual(
-            len(document.xpath("//a[@href='https://arxiv.org/abs/old?x=1&y=2']")),
-            3,
-        )
-
-    def test_unclassified_summary_row_only_appears_when_needed(self):
+    def test_unclassified_group_and_empty_topics_at_end_of_overview(self):
         unmatched = self.paper("3", "A general machine learning paper", "No configured terms.", "2026-09-03")
-        report = paperfetch.generate_email_html(
-            [unmatched],
-            paperfetch.KEYWORDS,
-            paperfetch.CATEGORIES,
-            7,
-        )
+        report = paperfetch.generate_email_html([unmatched], paperfetch.KEYWORDS, paperfetch.CATEGORIES, 7)
         document = lxml_html.fromstring(report)
-        topics = document.xpath("//table[@id='topic-summary']/tbody/tr/@data-topic")
+        self.assertEqual(document.xpath("//div[@class='topic-section']/@data-topic"), ["未分类"])
+        self.assertEqual(document.get_element_by_id("topic-summary")[-1].get("id"), "empty-topics")
+        self.assertFalse(document.get_element_by_id("topic-sections").xpath(".//*[@id='empty-topics']"))
+        self.assertEqual(document.xpath("//div[@class='topic-summary-group']/@data-topic"), ["未分类"])
+        self.assertEqual(document.xpath("//div[@class='empty-topic']/text()"),
+                         [f"{topic}（0 篇）" for topic in paperfetch.TOPICS])
+        for topic in paperfetch.TOPICS:
+            self.assertIn(topic, document.get_element_by_id("empty-topics").text_content())
 
-        self.assertEqual(topics, [*paperfetch.TOPICS, "未分类"])
+    def test_long_content_preserved_and_sorted_within_group_without_mutating_input(self):
+        import copy
+        summary = ("Full abstract <>& with a long token " + "x" * 400 + "\n\n") * 40
+        older = self.paper("2609.00001v1", "Vision-language alignment " + "title " * 100, summary, "2026-09-01")
+        older["authors"] = "Alice, Bob & Carol; " * 100
+        older["pdf_url"] = "https://arxiv.org/pdf/2609.00001v1?download=1&x=2"
+        newer = self.paper("2609.00002v1", "Vision-language alignment", "complete summary", "2026-09-02")
+        papers = [older, newer]
+        original = copy.deepcopy(papers)
+        document = lxml_html.fromstring(paperfetch.generate_email_html(papers, [], [], 7))
+        self.assertEqual(papers, original)
+        cards = document.xpath("//div[@class='paper-detail']")
+        self.assertEqual([card.get("data-arxiv-id") for card in cards], [newer["arxiv_id"], older["arxiv_id"]])
+        self.assertEqual(cards[1].xpath(".//div[@class='paper-abstract']")[0].text_content(), summary)
+        self.assertIn(older["authors"], cards[1].text_content())
+        self.assertEqual(cards[1].xpath(".//a[@class='paper-pdf-link']/@href"), [older["pdf_url"]])
+        overview_links = document.get_element_by_id("topic-summary").xpath(".//a[@class='topic-title-link']")
+        self.assertEqual([link.text_content() for link in overview_links], [newer["title"], older["title"]])
+        self.assertEqual([link.get("href") for link in overview_links], [newer["link"], older["link"]])
+
+    def test_empty_report_is_unchanged(self):
+        self.assertEqual(
+            paperfetch.generate_email_html([], paperfetch.KEYWORDS, paperfetch.CATEGORIES, 7),
+            paperfetch.build_empty_report(paperfetch.KEYWORDS, paperfetch.CATEGORIES, 7),
+        )
+
+    def test_no_empty_topic_block_when_all_topics_match(self):
+        paper = self.paper("all", "open vocabulary segmentation; vision-language alignment; "
+                           "multimodal alignment; unpaired alignment; optimal transport alignment", "Full abstract", "2026-09-01")
+        document = lxml_html.fromstring(paperfetch.generate_email_html([paper], [], [], 7))
+        self.assertEqual(document.xpath("//div[@class='topic-summary-group']/@data-topic"), list(paperfetch.TOPICS))
+        self.assertFalse(document.xpath("//*[@id='empty-topics']"))
+        self.assertEqual(len(document.xpath("//div[@class='paper-detail']")), 1)
+
+
+    def test_unsafe_links_are_not_rendered_as_active_urls(self):
+        paper = self.paper("bad", "Vision-language alignment", "Full text", "2026-09-01", "javascript:alert(1)")
+        paper["pdf_url"] = "javascript:alert(2)"
+        document = lxml_html.fromstring(paperfetch.generate_email_html([paper], [], [], 7))
+        self.assertEqual(document.xpath("//a/@href"), ["#", "#", "#"])
 
     def test_cached_papers_use_html_digest_with_warning_banner(self):
         cached_paper = self.paper(
@@ -653,7 +685,9 @@ class TopicDigestTests(unittest.TestCase):
         self.assertTrue(report.lower().startswith("<!doctype html>"))
         self.assertIn("Cached results:", report)
         self.assertIn("503 -&gt; 429", report)
-        self.assertIn('id="topic-summary"', report)
+        self.assertLess(report.index("Cached results:"), report.index('id="topic-summary"'))
+        self.assertLess(report.index('id="topic-summary"'), report.index('id="topic-sections"'))
+        self.assertIn('id="topic-sections"', report)
         self.assertIn("Vision-language alignment from cache", report)
 
 

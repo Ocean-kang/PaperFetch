@@ -12,7 +12,7 @@ This project is useful for researchers, students, and engineers who want a simpl
 
 * Query arXiv papers by category, keyword, and recent-day window.
 * Generate local CSV or Markdown paper digests.
-* Send mobile-friendly HTML digests with a topic summary table through SMTP.
+* Send mobile-friendly HTML digests with a single-column topic/title overview and complete abstracts through SMTP.
 * Support multiple arXiv categories such as `cs.CV`, `cs.CL`, and `cs.AI`.
 * Support scheduled server execution through `run.sh`.
 
@@ -336,8 +336,8 @@ Output details:
 
 * `PaperFetch.py` writes CSV files to `savefile/`.
 * `PaperFetch_daily.py` writes Markdown reports to `savefile/`.
-* `PaperFrech_daily_keyword.py` sends an HTML digest with a topic summary table and one detail card per paper unless `--dry-run` or `--no-email` is used.
-  On screens up to 480 pixels wide, each topic summary row becomes a full-width card with the topic, count, and paper list stacked vertically.
+* `PaperFrech_daily_keyword.py` sends an HTML digest with a single-column topic/title overview, complete abstracts, and one detail card per paper unless `--dry-run` or `--no-email` is used.
+  The default layout is single-column with inline styles, 12px side padding, and a 680px maximum width. Cross-topic papers appear under their first matching topic with all topic labels; other matching groups show a reference note. The opening overview lists every matching title under each topic in publication order (newest first), linking to arXiv; cross-topic titles appear in each matching group. Empty topics are listed with zero counts at the end of the overview only. Full abstracts and metadata are preserved. Verify enlarged text on the target mail app; browser previews do not reproduce Huawei system font scaling exactly.
 * `PaperFrech_daily_keyword.py` writes a latest successful digest cache under `cache/` and can use it as a fallback if arXiv fails later.
 * `run.sh` appends runtime logs to `log/run.log`.
 * `cron.log` should only show whether cron invoked `run.sh`; the main execution detail is in `log/run.log`.

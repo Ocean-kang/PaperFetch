@@ -1005,155 +1005,123 @@ def generate_email_html(
     )
     grouped_papers = group_papers_by_topic(ordered_papers)
 
-    summary_rows = []
+    # Match counts include cross-topic papers; details live under the first match.
+    sections = []
+    summary_sections = []
+    empty_topics = []
+    index = 0
+    wrap = "overflow-wrap:anywhere;word-wrap:break-word;word-break:break-word;"
+    metadata_style = f"margin:0 0 12px;color:#374151;font-size:16px;line-height:1.6;{wrap}"
     for topic_name, topic_papers in grouped_papers.items():
-        if topic_papers:
-            title_items = "".join(
-                '<li style="margin:0 0 7px;padding:0;line-height:1.45;">'
+        if not topic_papers:
+            empty_topics.append(topic_name)
+            continue
+        summary_sections.extend([
+            f'<div class="topic-summary-group" data-topic="{html.escape(topic_name, quote=True)}" '
+            'style="margin:0 0 24px;">',
+            f'<h3 style="margin:0 0 12px;font-size:22px;line-height:1.6;{wrap}">'
+            f'{html.escape(topic_name)} '
+            f'<span class="summary-topic-count" style="font-size:16px;font-weight:400;">'
+            f'（{len(topic_papers)} 篇）</span></h3>',
+        ])
+        for paper in topic_papers:
+            summary_sections.append(
                 f'<a class="topic-title-link" href="{safe_html_url(paper.get("link"))}" '
-                'style="color:#1558b0;text-decoration:none;overflow-wrap:anywhere;'
-                'word-break:break-word;">'
-                f'{html.escape(str(paper.get("title", "Untitled")))}</a></li>'
-                for paper in topic_papers
+                f'style="display:block;margin:0 0 12px;color:#1558b0;font-size:18px;'
+                f'line-height:1.6;{wrap}">'
+                f'{html.escape(str(paper.get("title", "Untitled")))}</a>'
             )
-            paper_titles = (
-                f'<ol class="topic-paper-list" style="margin:0;padding-left:20px;">'
-                f"{title_items}</ol>"
-            )
-        else:
-            paper_titles = '<span style="color:#7a8492;">No matching papers</span>'
-
-        summary_rows.append(
-            "".join(
-                [
-                    f'<tr class="topic-summary-row" data-topic="{html.escape(topic_name, quote=True)}">',
-                    '<th scope="row" class="topic-name" style="padding:12px 10px;',
-                    'border:1px solid #dce3eb;',
-                    'background:#f8fafc;text-align:left;vertical-align:top;font-size:14px;',
-                    'line-height:1.45;overflow-wrap:anywhere;word-break:break-word;">',
-                    html.escape(topic_name),
-                    '<span class="mobile-count-label" style="display:none;">',
-                    f"Count: {len(topic_papers)}",
-                    "</span>",
-                    "</th>",
-                    '<td class="topic-count" style="padding:12px 6px;border:1px solid #dce3eb;',
-                    'text-align:center;vertical-align:top;font-size:14px;">',
-                    str(len(topic_papers)),
-                    "</td>",
-                    '<td class="topic-papers" style="padding:12px 10px;border:1px solid #dce3eb;',
-                    'vertical-align:top;',
-                    'font-size:14px;line-height:1.45;overflow-wrap:anywhere;'
-                    'word-break:break-word;">',
-                    paper_titles,
-                    "</td></tr>",
-                ]
-            )
+        summary_sections.append('</div>')
+        sections.append(
+            f'<div class="topic-section" data-topic="{html.escape(topic_name, quote=True)}">'
+            f'<h2 style="margin:24px 0 16px;font-size:22px;line-height:1.6;{wrap}">'
+            f'{html.escape(topic_name)} '
+            f'<span class="topic-count" style="font-size:16px;font-weight:400;">'
+            f'({len(topic_papers)} papers)</span></h2>'
         )
-
-    detail_cards = []
-    for index, paper in enumerate(ordered_papers, 1):
-        paper_topics = matching_topics(paper) or ["未分类"]
-        topic_badges = " ".join(
-            '<span style="display:inline-block;margin:0 5px 5px 0;padding:3px 8px;'
-            'border-radius:12px;background:#e9f2ff;color:#174b87;font-size:12px;">'
-            f"{html.escape(topic_name)}</span>"
-            for topic_name in paper_topics
-        )
-        raw_arxiv_id = str(paper.get("arxiv_id", ""))
-        detail_cards.append(
-            "".join(
-                [
-                    '<table role="presentation" class="paper-detail" ',
-                    f'data-arxiv-id="{html.escape(raw_arxiv_id, quote=True)}" ',
-                    'width="100%" cellspacing="0" cellpadding="0" style="width:100%;',
-                    'margin:0 0 16px;border:1px solid #dce3eb;border-radius:8px;',
-                    'background:#ffffff;table-layout:fixed;"><tr><td style="padding:16px;'
-                    'overflow-wrap:anywhere;word-break:break-word;">',
-                    '<div style="margin:0 0 8px;color:#172033;font-size:18px;font-weight:700;',
-                    'line-height:1.4;">',
-                    f'{index}. <a class="paper-title-link" '
-                    f'href="{safe_html_url(paper.get("link"))}" '
-                    'style="color:#1558b0;text-decoration:none;overflow-wrap:anywhere;'
-                    'word-break:break-word;">',
-                    html.escape(str(paper.get("title", "Untitled"))),
-                    "</a></div>",
-                    f'<div style="margin:0 0 8px;">{topic_badges}</div>',
-                    '<div style="margin:0 0 10px;color:#5b6573;font-size:13px;line-height:1.6;">',
-                    f"<strong>arXiv ID:</strong> {html.escape(raw_arxiv_id)}<br>",
-                    f'<strong>Authors:</strong> {html.escape(str(paper.get("authors", "")))}<br>',
-                    f'<strong>Category:</strong> {html.escape(str(paper.get("category", "")))}<br>',
-                    f'<strong>Published:</strong> {html.escape(str(paper.get("published", "")))}',
-                    "</div>",
-                    '<div style="color:#2f3742;font-size:14px;line-height:1.65;">',
-                    html.escape(str(paper.get("summary", ""))),
-                    "</div></td></tr></table>",
-                ]
+        shared_owners = {}
+        for paper in topic_papers:
+            paper_topics = matching_topics(paper) or ["未分类"]
+            if paper_topics[0] != topic_name:
+                owner = paper_topics[0]
+                shared_owners[owner] = shared_owners.get(owner, 0) + 1
+                continue
+            index += 1
+            raw_arxiv_id = str(paper.get("arxiv_id", ""))
+            # Derive the PDF only from a recognized arXiv abstract URL.
+            raw_link = str(paper.get("link") or "").strip()
+            pdf_url = paper.get("pdf_url") or paper.get("pdf_link")
+            if not pdf_url:
+                match = re.match(r"^https?://(?:www\.)?arxiv\.org/abs/([^?#]+)", raw_link, re.I)
+                if match:
+                    pdf_url = "https://arxiv.org/pdf/" + match.group(1)
+            link_style = f"display:block;padding:12px 0;color:#1558b0;font-size:18px;line-height:1.6;{wrap}"
+            sections.extend([
+                f'<div class="paper-detail" data-arxiv-id="{html.escape(raw_arxiv_id, quote=True)}" '
+                f'style="margin:0 0 24px;padding:0 0 24px;border-bottom:1px solid #dce3eb;{wrap}">',
+                f'<h3 style="margin:0 0 12px;color:#172033;font-size:22px;font-weight:700;line-height:1.6;{wrap}">',
+                f'{index}. <a class="paper-title-link" href="{safe_html_url(raw_link)}" '
+                f'style="color:#172033;text-decoration:none;{wrap}">',
+                html.escape(str(paper.get("title", "Untitled"))),
+                '</a></h3>',
+                f'<p class="paper-topics" style="{metadata_style}">'
+                f'<strong>Topics:</strong> {html.escape(" · ".join(paper_topics))}</p>',
+                f'<div class="paper-metadata" style="{metadata_style}">',
+                f'<strong>arXiv ID:</strong> {html.escape(raw_arxiv_id)}<br>',
+                f'<strong>Authors:</strong> {html.escape(str(paper.get("authors", "")))}<br>',
+                f'<strong>Category:</strong> {html.escape(str(paper.get("category", "")))}<br>',
+                f'<strong>Published:</strong> {html.escape(str(paper.get("published", "")))}',
+                '</div>',
+                f'<div class="paper-abstract" style="color:#172033;font-size:18px;line-height:1.6;white-space:pre-wrap;{wrap}">',
+                html.escape(str(paper.get("summary", ""))),
+                '</div>',
+                f'<a class="paper-original-link" href="{safe_html_url(raw_link)}" style="{link_style}">View on arXiv</a>',
+            ])
+            if pdf_url and safe_html_url(pdf_url) != "#":
+                sections.append(f'<a class="paper-pdf-link" href="{safe_html_url(pdf_url)}" style="{link_style}">Open PDF</a>')
+            sections.append('</div>')
+        for owner, count in shared_owners.items():
+            sections.append(
+                f'<p class="shared-topic-note" style="{metadata_style}">'
+                f'{count} matching paper(s) shown under {html.escape(owner)}.</p>'
             )
-        )
+        sections.append('</div>')
 
+    if empty_topics:
+        summary_sections.append(
+            f'<div id="empty-topics" style="{metadata_style}">'
+            '<strong>暂无匹配论文</strong>'
+        )
+        for topic_name in empty_topics:
+            summary_sections.append(
+                f'<div class="empty-topic" data-topic="{html.escape(topic_name, quote=True)}">'
+                f'{html.escape(topic_name)}（0 篇）</div>'
+            )
+        summary_sections.append('</div>')
     category_text = html.escape(", ".join(categories))
-    return "".join(
-        [
-            "<!doctype html><html><head>",
-            '<meta charset="utf-8"><meta name="viewport" '
-            'content="width=device-width,initial-scale=1">',
-            '<style>@media only screen and (max-width:480px){'
-            '.email-shell{padding:8px 4px!important}.email-content{padding:16px 10px!important}'
-            '#topic-summary{display:block!important;width:100%!important;table-layout:auto!important;'
-            'border-collapse:separate!important;margin-bottom:20px!important}'
-            '#topic-summary .topic-summary-columns,#topic-summary .topic-summary-head{display:none!important}'
-            '#topic-summary .topic-summary-body{display:block!important;width:100%!important}'
-            '#topic-summary .topic-summary-row{display:block!important;width:100%!important;'
-            'box-sizing:border-box!important;margin:0 0 12px!important;border:1px solid #dce3eb!important;'
-            'border-radius:8px!important;overflow:hidden!important;background:#ffffff!important}'
-            '#topic-summary .topic-name,#topic-summary .topic-count,#topic-summary .topic-papers{'
-            'display:block!important;width:100%!important;box-sizing:border-box!important;'
-            'border:0!important;text-align:left!important}'
-            '#topic-summary .topic-name{padding:12px!important;background:#eef4fb!important;'
-            'font-size:15px!important;line-height:1.45!important}'
-            '#topic-summary .topic-count{padding:9px 12px 0!important;color:#5b6573!important;'
-            'font-size:13px!important;line-height:1.4!important;display:none!important}'
-            '#topic-summary .topic-papers{padding:9px 12px 12px!important;font-size:15px!important;'
-            'line-height:1.55!important;overflow-wrap:anywhere!important;word-break:break-word!important}'
-            '#topic-summary .topic-paper-list{margin:0!important;padding-left:20px!important}'
-            '#topic-summary .mobile-count-label{display:block!important;margin-top:4px!important;'
-            'color:#5b6573!important;font-size:13px!important;font-weight:400!important}'
-            '}</style>',
-            f"<title>{html.escape(heading)}</title></head>",
-            '<body style="margin:0;padding:0;background:#f3f6fa;'
-            'font-family:Arial,Helvetica,sans-serif;color:#172033;">',
-            '<div style="display:none;max-height:0;overflow:hidden;">',
-            f"{len(ordered_papers)} papers across {len(TOPICS)} research topics.</div>",
-            '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" '
-            'style="width:100%;background:#f3f6fa;"><tr><td align="center" '
-            'class="email-shell" style="padding:16px 8px;">',
-            '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" '
-            'style="width:100%;max-width:760px;background:#ffffff;border-radius:10px;">',
-            '<tr><td class="email-content" style="padding:22px 18px;">',
-            f'<h1 style="margin:0 0 8px;font-size:24px;line-height:1.3;">'
-            f"{html.escape(heading)}</h1>",
-            '<p style="margin:0 0 20px;color:#5b6573;font-size:14px;line-height:1.5;">',
-            f"Last {days} days &middot; {len(ordered_papers)} papers &middot; "
-            f"{category_text}</p>",
-            notice_html,
-            '<h2 style="margin:0 0 10px;font-size:19px;line-height:1.4;">Topic Summary</h2>',
-            '<table id="topic-summary" class="topic-summary-table" width="100%" cellspacing="0" '
-            'cellpadding="0" '
-            'style="width:100%;table-layout:fixed;border-collapse:collapse;margin:0 0 24px;">',
-            '<colgroup class="topic-summary-columns"><col style="width:26%;"><col style="width:13%;">'
-            '<col style="width:61%;"></colgroup>',
-            '<thead class="topic-summary-head"><tr><th style="padding:10px;border:1px solid #cbd5e1;'
-            'background:#eaf0f7;text-align:left;font-size:13px;">Topic</th>',
-            '<th style="padding:10px 4px;border:1px solid #cbd5e1;'
-            'background:#eaf0f7;text-align:center;font-size:13px;">Count</th>',
-            '<th style="padding:10px;border:1px solid #cbd5e1;'
-            'background:#eaf0f7;text-align:left;font-size:13px;">Papers</th></tr></thead>',
-            f'<tbody class="topic-summary-body">{"".join(summary_rows)}</tbody></table>',
-            '<h2 style="margin:0 0 12px;font-size:19px;line-height:1.4;">Paper Details</h2>',
-            "".join(detail_cards),
-            "</td></tr></table></td></tr></table></body></html>",
-        ]
-    )
+    return "".join([
+        '<!doctype html><html><head><meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width,initial-scale=1">',
+        f'<title>{html.escape(heading)}</title></head>',
+        '<body style="margin:0;padding:0;background:#ffffff;'
+        'font-family:Arial,Helvetica,sans-serif;color:#172033;font-size:18px;line-height:1.6;">',
+        '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" '
+        'style="width:100%;table-layout:fixed;border-collapse:collapse;"><tr><td align="center" style="padding:0;">',
+        '<div class="email-container" style="width:100%;max-width:680px;margin:0 auto;text-align:left;">',
+        f'<div class="email-content" style="padding:20px 12px;{wrap}">',
+        f'<h1 style="margin:0 0 8px;font-size:24px;line-height:1.6;{wrap}">{html.escape(heading)}</h1>',
+        f'<p style="{metadata_style}">Last {days} days &middot; '
+        f'{len(ordered_papers)} papers &middot; {category_text}</p>',
+        notice_html,
+        '<div id="topic-summary" style="margin:24px 0;padding:0 0 12px;border-bottom:1px solid #dce3eb;">',
+        '<h2 style="margin:0 0 16px;font-size:22px;line-height:1.6;">分类汇总</h2>',
+        "".join(summary_sections),
+        '</div>',
+        '<h2 style="margin:0 0 16px;font-size:22px;line-height:1.6;">Paper Details</h2>',
+        '<div id="topic-sections">',
+        "".join(sections),
+        '</div></div></div></td></tr></table></body></html>',
+    ])
 
 
 def load_email_config() -> Any:
