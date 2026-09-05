@@ -587,8 +587,13 @@ class TopicDigestTests(unittest.TestCase):
                          ["开放词汇分割", "视觉语言对齐", "分布、几何与表征空间对齐"])
         self.assertEqual(overview.xpath(".//span[@class='summary-topic-count']/text()"), ["（1 篇）"] * 3)
         for group, paper in zip(groups, [older, older, newer]):
-            links = group.xpath(".//a[@class='topic-title-link']")
-            self.assertEqual([link.text_content() for link in links], [paper["title"]])
+            rows = group.xpath("./div[@class='summary-paper']")
+            self.assertEqual(len(rows), 1)
+            titles = rows[0].xpath("./span[@class='summary-paper-title']")
+            self.assertEqual([title.text_content() for title in titles], [paper["title"]])
+            self.assertFalse(titles[0].xpath(".//a | ancestor::a"))
+            links = rows[0].xpath("./a")
+            self.assertEqual([link.text_content() for link in links], ["[arxiv]"])
             self.assertEqual([link.get("href") for link in links], [paper["link"]])
         self.assertLess(report.index('id="topic-summary"'), report.index('id="topic-sections"'))
         sections = document.xpath("//div[@class='topic-section']")
@@ -642,8 +647,12 @@ class TopicDigestTests(unittest.TestCase):
         self.assertEqual(cards[1].xpath(".//div[@class='paper-abstract']")[0].text_content(), summary)
         self.assertIn(older["authors"], cards[1].text_content())
         self.assertEqual(cards[1].xpath(".//a[@class='paper-pdf-link']/@href"), [older["pdf_url"]])
-        overview_links = document.get_element_by_id("topic-summary").xpath(".//a[@class='topic-title-link']")
-        self.assertEqual([link.text_content() for link in overview_links], [newer["title"], older["title"]])
+        overview = document.get_element_by_id("topic-summary")
+        titles = overview.xpath(".//span[@class='summary-paper-title']")
+        self.assertEqual([title.text_content() for title in titles], [newer["title"], older["title"]])
+        self.assertFalse(overview.xpath(".//span[@class='summary-paper-title']//a"))
+        overview_links = overview.xpath(".//a[@class='summary-arxiv-link']")
+        self.assertEqual([link.text_content() for link in overview_links], ["[arxiv]", "[arxiv]"])
         self.assertEqual([link.get("href") for link in overview_links], [newer["link"], older["link"]])
 
     def test_empty_report_is_unchanged(self):
@@ -689,6 +698,11 @@ class TopicDigestTests(unittest.TestCase):
         self.assertLess(report.index('id="topic-summary"'), report.index('id="topic-sections"'))
         self.assertIn('id="topic-sections"', report)
         self.assertIn("Vision-language alignment from cache", report)
+        overview = lxml_html.fromstring(report).get_element_by_id("topic-summary")
+        self.assertEqual(overview.xpath(".//span[@class='summary-paper-title']/text()"),
+                         [cached_paper["title"]])
+        self.assertEqual(overview.xpath(".//a/text()"), ["[arxiv]"])
+        self.assertEqual(overview.xpath(".//a/@href"), [cached_paper["link"]])
 
 
 if __name__ == "__main__":

@@ -1018,18 +1018,22 @@ def generate_email_html(
             continue
         summary_sections.extend([
             f'<div class="topic-summary-group" data-topic="{html.escape(topic_name, quote=True)}" '
-            'style="margin:0 0 24px;">',
-            f'<h3 style="margin:0 0 12px;font-size:22px;line-height:1.6;{wrap}">'
+            'style="margin:0 0 16px;">',
+            f'<h3 style="margin:0;padding:6px 8px;border-left:3px solid #8c2430;'
+            f'background:#f3f4f6;color:#8c2430;font-size:16px;line-height:1.4;{wrap}">'
             f'{html.escape(topic_name)} '
-            f'<span class="summary-topic-count" style="font-size:16px;font-weight:400;">'
+            f'<span class="summary-topic-count" style="color:#6b7280;font-size:12px;font-weight:400;">'
             f'（{len(topic_papers)} 篇）</span></h3>',
         ])
-        for paper in topic_papers:
+        for paper_index, paper in enumerate(topic_papers):
+            separator = "border-top:1px solid #e5e7eb;" if paper_index else ""
             summary_sections.append(
-                f'<a class="topic-title-link" href="{safe_html_url(paper.get("link"))}" '
-                f'style="display:block;margin:0 0 12px;color:#1558b0;font-size:18px;'
-                f'line-height:1.6;{wrap}">'
-                f'{html.escape(str(paper.get("title", "Untitled")))}</a>'
+                f'<div class="summary-paper" style="margin:0;padding:8px 0;{separator}'
+                f'color:#374151;font-size:14px;font-weight:400;line-height:1.4;{wrap}">'
+                f'<span class="summary-paper-title">{html.escape(str(paper.get("title", "Untitled")))}</span> '
+                f'<a class="summary-arxiv-link" href="{safe_html_url(paper.get("link"))}" '
+                'style="display:inline-block;color:#1558b0;font-size:14px;line-height:1.4;'
+                'text-decoration:underline;white-space:nowrap;">[arxiv]</a></div>'
             )
         summary_sections.append('</div>')
         sections.append(
@@ -1114,7 +1118,7 @@ def generate_email_html(
         f'{len(ordered_papers)} papers &middot; {category_text}</p>',
         notice_html,
         '<div id="topic-summary" style="margin:24px 0;padding:0 0 12px;border-bottom:1px solid #dce3eb;">',
-        '<h2 style="margin:0 0 16px;font-size:22px;line-height:1.6;">分类汇总</h2>',
+        '<h2 style="margin:0 0 12px;font-size:18px;line-height:1.4;">分类汇总</h2>',
         "".join(summary_sections),
         '</div>',
         '<h2 style="margin:0 0 16px;font-size:22px;line-height:1.6;">Paper Details</h2>',
