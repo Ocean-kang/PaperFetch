@@ -9,6 +9,7 @@ import hashlib
 import html
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -86,10 +87,33 @@ SMTP_PORT = 465
 
 LAST_ARXIV_REQUEST_TS = 0.0
 LOGGER = logging.getLogger("paperfetch")
+BEIJING = timezone(timedelta(hours=8))
+
+
+class PaperResults(list):
+    """List-compatible result carrying the oldest contributing fetch timestamp."""
+    created_at: str | None = None
+
+
+def atomic_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as fp:
+            json.dump(payload, fp, ensure_ascii=False, indent=2)
+            fp.flush()
+            os.fsync(fp.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class ArxivFetchError(RuntimeError):
     """Base exception for arXiv fetch failures."""
+
+
+class ArxivPermanentError(ArxivFetchError):
+    """An API client error that must not be retried automatically."""
 
 
 class ArxivServiceBusyError(ArxivFetchError):
@@ -110,6 +134,7 @@ class ArxivRateLimitCooldownError(ArxivServiceBusyError):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fetch arXiv papers and send a daily digest.")
+    parser.add_argument("--scheduled", action="store_true", help="Run the persistent daily recovery scheduler.")
     parser.add_argument("--days", type=int, default=DAYS, help="Recent days to query.")
     parser.add_argument("--max-results", type=int, default=MAX_RESULTS, help="Maximum arXiv results to request.")
     parser.add_argument("--dry-run", action="store_true", help="Run fully but do not send email.")
@@ -220,7 +245,8 @@ def retry_after_seconds(exc: HTTPError) -> float | None:
     if not value:
         return None
     try:
-        return max(0.0, float(value))
+        seconds = float(value)
+        return max(0.0, seconds) if math.isfinite(seconds) else None
     except ValueError:
         try:
             retry_at = parsedate_to_datetime(value)
@@ -378,6 +404,7 @@ def rate_limited_fetch(
     endpoint: str,
     params: dict[str, str | int],
     max_retries: int = MAX_ARXIV_RETRIES,
+    deferred_backoff: float | None = None,
 ) -> bytes:
     enforce_arxiv_rate_limit_cooldown()
     last_error: Exception | None = None
@@ -419,7 +446,8 @@ def rate_limited_fetch(
                     else DEFAULT_ARXIV_BUSY_WAIT_SECONDS
                 )
                 may_retry = (
-                    not busy_retry_used
+                    deferred_backoff is None
+                    and not busy_retry_used
                     and attempt < max_retries - 1
                     and retry_wait <= MAX_ARXIV_BUSY_WAIT_SECONDS
                 )
@@ -444,6 +472,7 @@ def rate_limited_fetch(
                 state = write_arxiv_rate_limit_state(
                     exc,
                     response_hint=response_hint,
+                    fallback_cooldown_seconds=deferred_backoff or DEFAULT_ARXIV_COOLDOWN_SECONDS,
                 )
                 retry_detail = state["retry_after_until"]
                 sequence = " -> ".join(str(value) for value in status_sequence)
@@ -456,12 +485,14 @@ def rate_limited_fetch(
                 raise error_type(
                     "arXiv is temporarily unavailable due to service capacity or rate limiting. "
                     f"Response sequence: {sequence}. Next request is allowed after "
-                    f"{retry_detail}. Use cached results if available.",
+                    f"{retry_detail} ({state['wait_source']}; this is not a recovery promise). "
+                    f"Beijing: {parse_cache_datetime(retry_detail).astimezone(BEIJING).isoformat()}. "
+                    "Use cached results if available.",
                     status_sequence,
                 ) from exc
 
             if status_code is not None and 400 <= status_code < 500:
-                raise ArxivFetchError(
+                raise ArxivPermanentError(
                     f"arXiv returned non-retryable HTTP {status_code} for the API request."
                 ) from exc
 
@@ -502,6 +533,11 @@ def parse_feed(data: bytes) -> Any:
     feed = feedparser.parse(data)
     if getattr(feed, "bozo", False):
         raise RuntimeError(f"arXiv feed parse failed: {getattr(feed, 'bozo_exception', 'unknown error')}")
+    if not str(getattr(feed, "version", "")).startswith("atom"):
+        raise ArxivFetchError("arXiv returned HTTP success without a valid Atom feed")
+    for entry in feed.entries:
+        if "/api/errors" in entry.get("id", ""):
+            raise ArxivPermanentError(f"arXiv API error feed: {entry.get('summary', 'unknown error')}")
     return feed
 
 
@@ -576,7 +612,7 @@ def load_latest_cache(
         return None
 
     age = datetime.now(timezone.utc) - created_at
-    if age > timedelta(days=max_age_days):
+    if age < timedelta(0) or age > timedelta(days=max_age_days):
         LOGGER.warning(
             "latest arXiv cache is too old: path=%s age_days=%.2f max_age_days=%s",
             path,
@@ -597,8 +633,7 @@ def write_cache(path: Path, raw_query: str, papers: list[dict[str, Any]]) -> Non
         "query": raw_query,
         "papers": papers,
     }
-    with path.open("w", encoding="utf-8") as fp:
-        json.dump(payload, fp, ensure_ascii=False, indent=2)
+    atomic_json(path, payload)
     LOGGER.info("wrote arXiv cache: %s", path)
 
 
@@ -612,7 +647,7 @@ def write_latest_cache(
     path = latest_cache_path(keywords, categories, days, max_results)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": getattr(papers, "created_at", None) or datetime.now(timezone.utc).isoformat(),
         "query": {
             "categories": categories,
             "keywords": keywords,
@@ -621,8 +656,7 @@ def write_latest_cache(
         },
         "papers": papers,
     }
-    with path.open("w", encoding="utf-8") as fp:
-        json.dump(payload, fp, ensure_ascii=False, indent=2)
+    atomic_json(path, payload)
     LOGGER.info("wrote latest arXiv cache: %s", path)
 
 
@@ -745,6 +779,7 @@ def fetch_arxiv_papers(
     days: int,
     max_results: int,
     no_cache: bool,
+    deferred_backoff: float | None = None,
 ) -> list[dict[str, Any]]:
     batches = chunked(keywords, KEYWORD_BATCH_SIZE)
     LOGGER.info(
@@ -756,6 +791,7 @@ def fetch_arxiv_papers(
     papers_by_id: dict[str, dict[str, Any]] = {}
     failures: list[str] = []
     successful_batches = 0
+    fetched_times = []
 
     for index, batch in enumerate(batches, 1):
         endpoint, request_params, raw_query = build_arxiv_request(categories, batch, days, max_results)
@@ -771,15 +807,24 @@ def fetch_arxiv_papers(
         if not no_cache:
             cached = load_cache(path)
             if cached is not None:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                timestamp = parse_cache_datetime(payload.get("created_at"))
+                if timestamp is None:
+                    raise ArxivFetchError(f"Cache has no valid fetch timestamp: {path}")
+                fetched_times.append(timestamp)
                 successful_batches += 1
                 for paper in cached:
                     papers_by_id[paper["arxiv_id"]] = paper
                 continue
 
         try:
-            data = rate_limited_fetch(endpoint, request_params)
+            if deferred_backoff is None:
+                data = rate_limited_fetch(endpoint, request_params)
+            else:
+                data = rate_limited_fetch(endpoint, request_params, deferred_backoff=deferred_backoff)
             feed = parse_feed(data)
             batch_papers = papers_from_feed(feed, batch)
+            fetched_times.append(datetime.now(timezone.utc))
             successful_batches += 1
             LOGGER.info("batch %s matched paper count=%s", index, len(batch_papers))
             for paper in batch_papers:
@@ -787,9 +832,9 @@ def fetch_arxiv_papers(
 
             if not no_cache:
                 write_cache(path, raw_query, batch_papers)
-        except ArxivServiceBusyError:
+        except (ArxivServiceBusyError, ArxivPermanentError):
             LOGGER.exception(
-                "arXiv service busy at keyword batch %s/%s; stop remaining batches",
+                "arXiv retrieval stopped at keyword batch %s/%s",
                 index,
                 len(batches),
             )
@@ -808,9 +853,10 @@ def fetch_arxiv_papers(
         raise RuntimeError(f"Failed to fetch arXiv feed for all keyword batches: {detail}")
 
     if failures:
-        LOGGER.warning("arXiv completed with %s failed keyword batch(es)", len(failures))
+        raise ArxivFetchError("Incomplete arXiv result: " + "; ".join(failures))
 
-    papers = list(papers_by_id.values())
+    papers = PaperResults(papers_by_id.values())
+    papers.created_at = min(fetched_times).isoformat() if fetched_times else None
     papers.sort(key=lambda item: item["published"], reverse=True)
     LOGGER.info("final matched paper count=%s", len(papers))
     return papers
@@ -831,7 +877,7 @@ def build_cache_fallback_subject(days: int) -> str:
 
 
 def build_empty_report(keywords: list[str], categories: list[str], days: int) -> str:
-    run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    run_time = datetime.now(BEIJING).strftime("%Y-%m-%d %H:%M:%S Beijing (UTC+08:00)")
     return "\n".join(
         [
             "# PaperFetch Search Result",
@@ -883,7 +929,7 @@ def build_failure_report(
     cache_hit: bool = False,
     cache_created_at: str | None = None,
 ) -> str:
-    run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    run_time = datetime.now(BEIJING).strftime("%Y-%m-%d %H:%M:%S Beijing (UTC+08:00)")
     request_summary, cause = arxiv_failure_context(error)
     response_sequence = arxiv_response_sequence(error) or "not available"
 
@@ -923,8 +969,13 @@ def build_cache_fallback_report(
     days: int,
 ) -> str:
     cached_created_at = cached_payload.get("created_at", "unknown")
+    parsed_created_at = parse_cache_datetime(cached_created_at)
+    cache_age = ((datetime.now(timezone.utc) - parsed_created_at).total_seconds() / 3600
+                 if parsed_created_at else None)
+    freshness = (f"{parsed_created_at.astimezone(BEIJING).isoformat()}; age {cache_age:.1f} hours"
+                 if parsed_created_at else "unknown")
     papers = cached_payload.get("papers", [])
-    run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    run_time = datetime.now(BEIJING).strftime("%Y-%m-%d %H:%M:%S Beijing (UTC+08:00)")
     request_summary, _ = arxiv_failure_context(error)
     response_sequence = arxiv_response_sequence(error) or "not available"
     if papers:
@@ -938,6 +989,7 @@ def build_cache_fallback_report(
                 f"<strong>Error:</strong> {html.escape(str(error))}<br>",
                 f"<strong>arXiv response sequence:</strong> {html.escape(response_sequence)}<br>",
                 f"<strong>Cache created_at:</strong> {html.escape(str(cached_created_at))}<br>",
+                f"<strong>Cache Beijing time / age:</strong> {html.escape(freshness)}<br>",
                 f"<strong>Cached paper count:</strong> {len(papers)}<br>",
                 f"<strong>Run time:</strong> {html.escape(run_time)}",
                 "</div>",
@@ -974,6 +1026,7 @@ def build_cache_fallback_report(
             f"- Error message: {error}",
             f"- arXiv response sequence: {response_sequence}",
             f"- Cache created_at: {cached_created_at}",
+            f"- Cache Beijing time / age: {freshness}",
             f"- Search window: last {days} days",
             f"- arXiv categories: {', '.join(categories)}",
             f"- Keyword count: {len(keywords)}",
@@ -1162,6 +1215,9 @@ def main() -> int:
 
     keywords = normalize_keywords(KEYWORDS)
     categories = [category.strip() for category in CATEGORIES if category.strip()]
+    if getattr(args, "scheduled", False):
+        from paperfetch_scheduler import run_scheduled
+        return run_scheduled(args, keywords, categories)
     LOGGER.info("starting PaperFetch days=%s max_results=%s", args.days, min(args.max_results, 100))
 
     should_send_email = not args.dry_run and not args.no_email

@@ -174,24 +174,33 @@ Run manually:
 bash run.sh
 ```
 
-Example cron entry:
+Production cron entries (the server's cron timezone must be Asia/Shanghai):
 
 ```bash
-30 18 * * * /bin/bash -lc 'cd /root/code/PaperFetch && bash run.sh' >> /root/code/PaperFetch/cron.log 2>&1
+*/30 9-20 * * * /bin/bash -lc '/bin/bash /root/code/PaperFetch/run.sh --scheduled' >> /root/code/PaperFetch/cron.log 2>&1
+0 21 * * * /bin/bash -lc '/bin/bash /root/code/PaperFetch/run.sh --scheduled' >> /root/code/PaperFetch/cron.log 2>&1
 ```
 
-Recommended frequency is once per day, or at most once every 12 hours:
+Replace the old PaperFetch cron entry; do not add these alongside it. Preserve unrelated
+jobs, including the 06:00 Quantitative-Trading task. Check `date '+%F %T %z'` before using
+these hours. Do not change the whole server timezone merely for this task: if cron uses UTC,
+use `*/30 1-12 * * *` and `0 13 * * *` instead. The Python scheduler always uses Beijing time.
 
-```bash
-30 9,21 * * * /bin/bash -lc 'cd /root/code/PaperFetch && bash run.sh' >> /root/code/PaperFetch/cron.log 2>&1
-```
+These are wakeups, not a request every half hour. `--scheduled` sends the first request
+at the first wakeup from 09:00 through 21:00. After success, subsequent wakeups do nothing.
+On 429/503 it exits immediately and persists a 30, 60, then 120 minute backoff (capped at
+120 minutes). A valid `Retry-After` is also respected, including across midnight.
+The next request runs on the first cron wakeup at or after both deadlines; response duration
+can therefore shift it to a later half-hour slot. At most eight fetch rounds run per Beijing
+day, with no fetching after 21:00. Timeout and other recoverable errors retain their bounded
+in-round retries. Non-retryable API client errors stop that day's fetching.
 
-Do not keep a test schedule such as `* * * * *` or `*/5 * * * *` for PaperFetch in production.
-High-frequency runs can trigger arXiv HTTP 429 rate limits. PaperFetch uses cache-friendly
-GET requests and treats HTTP 429 and 503 as temporary service-capacity signals: it waits at
-most five minutes, retries once, and then falls back to the latest successful cache. The
-`run.sh` wrapper also uses `flock` so an accidental high-frequency cron entry will not run
-concurrent jobs.
+The first failure sends one cached digest or failure notice. Later failures only log their
+status. Successful recovery sends one fresh digest (including a valid zero-match result).
+No cache is relabeled as a fresh recovery. Normal single-run operation without `--scheduled`
+retains its existing five-minute capacity retry for compatibility; do not schedule that mode
+every half hour. `run.sh` retains `flock` and its 600-second timeout; the Python scheduler
+also locks direct scheduled invocations.
 
 Useful deployment checks:
 
@@ -216,6 +225,7 @@ tail -200 /root/code/PaperFetch/log/run.log
 
 | Argument | Type | Default | Description |
 | -------- | ---: | ------: | ----------- |
+| `--scheduled` | flag | off | Persistent daily recovery with notification deduplication; use with the production cron entries above. |
 | `--days` | int | `7` | Recent UTC days to query through `submittedDate`. |
 | `--max-results` | int | `100` | Maximum arXiv results to request. Values above 100 are capped at 100. |
 | `--dry-run` | flag | off | Fetch, filter, and generate the report, but do not send email. |
@@ -224,6 +234,12 @@ tail -200 /root/code/PaperFetch/log/run.log
 | `--no-cache-fallback` | flag | off | Disable the latest-cache digest fallback when arXiv fails. |
 | `--cache-fallback-max-age-days` | int | `7` | Maximum age for cached digest fallback results. |
 | `--log-level` | str | `INFO` | Python logging level, such as `INFO` or `DEBUG`. |
+
+With `--scheduled`, `--dry-run` or `--no-email` produces a read-only state preview: no
+network, email, lock file or production state changes. For a live no-email test use the
+existing single-run command below. Scheduled fetches always request fresh results when due;
+`--no-cache` suppresses writing the latest paper cache but does not disable scheduler or
+cooldown persistence. Use `--no-cache-fallback` to suppress old-paper fallback notifications.
 
 Safe manual test:
 
@@ -369,6 +385,53 @@ bash run.sh
 
 ## Production Verification
 
+After copying the updated repository (including `paperfetch_scheduler.py`) to the server:
+
+```bash
+cd /root/code/PaperFetch
+/root/miniconda3/envs/paperfetch/bin/python -m unittest discover -s tests -q
+/bin/bash run.sh --scheduled --dry-run
+crontab -e
+```
+
+In `crontab -e`, replace only the old PaperFetch entry with the two entries above. Keep:
+
+```cron
+0 6 * * * /root/code/Quantitative-Trading/run_tasks.sh
+```
+
+During the Beijing daily window, perform one scheduled run:
+
+```bash
+/bin/bash /root/code/PaperFetch/run.sh --scheduled
+tail -100 /root/code/PaperFetch/log/run.log
+```
+
+Acceptance requires `fetch_success fetched_at=...` and `delivery_sent`, backed by an
+actual valid arXiv response. `fetch_degraded`, `waiting_recovery`, or wrapper `exit=0`
+alone do not mean new papers were obtained. For persistent 429, retain the HTTP status,
+body hint, Retry-After, Via, X-Cache and UTC timestamps already logged for arXiv support.
+Do not delete the cooldown or rotate addresses to force retries.
+
+Scheduler state lives in `cache/schedule_<Beijing-date>_arxiv_latest_<config-hash>.json`.
+It preserves attempt count, deadlines, fetch time and queued email bodies. State writes
+are atomic; malformed state stops execution with `scheduler_state_error`. Keep this
+directory across deployments and restarts. Historical daily states are kept for diagnosis.
+Do not delete today's state to retry: it would discard duplicate-send protection.
+
+Explicit SMTP rejections/configuration failures keep the email pending for the next wakeup,
+which retries delivery without fetching. A connection loss or crash during sending may
+leave delivery uncertain. `delivery_uncertain` requires checking the recipient mailbox/SMTP
+logs. Stop PaperFetch cron temporarily, back up the relevant state file, then change only
+that message's `status` to `sent` if delivered or `pending` if confirmed not delivered,
+and restore cron. Never reset the whole state. Pending messages are serviced only during
+their own day's window; unresolved delivery at the cutoff needs manual review of that
+day's state. The next day starts a new digest and does not automatically send stale notices.
+
+To roll back scheduling, restore the once-daily cron command without `--scheduled`;
+preserve all cache and state files. This restores the old behavior and its lack of same-day
+recovery. No database migration or new Python dependencies are required.
+
 Check cron is not running a per-minute PaperFetch test job:
 
 ```bash
@@ -493,7 +556,12 @@ tail -n 100 log/run.log
 
 ### 5. `PaperFetch Run Failed` Emails
 
-The keyword digest sends a failure email when every arXiv keyword batch fails or when arXiv remains unavailable after a limited retry. HTTP 429 and 503 can reflect arXiv-wide service capacity, a shared outbound IP, or caller traffic; a 429 response does not by itself prove that this task ran too frequently. PaperFetch waits at most five minutes before one capacity retry, then records a 30-minute cooldown when arXiv does not provide a `Retry-After` deadline.
+The keyword digest sends a failure email when retrieval fails or is incomplete. HTTP 429
+and 503 can reflect arXiv-wide service capacity, a shared outbound IP, or caller traffic;
+a 429 response does not by itself prove that this task ran too frequently. Scheduled mode
+uses the persisted recovery policy above. Single-run mode retains one capacity retry.
+Deadlines labeled `default-cooldown` are local policy, not arXiv recovery promises;
+`Retry-After` identifies a server-supplied deadline.
 
 If a recent successful digest cache exists, PaperFetch sends a cached digest instead of a full failure email. The subject includes `using cached results`, and the body lists the cache `created_at` time and HTTP response sequence. This means the current arXiv request failed; the papers in that email came from the latest successful cached run, not from a fresh arXiv response that day.
 

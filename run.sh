@@ -54,7 +54,7 @@ if [[ ! -f "$SCRIPT" ]]; then
 fi
 
 set +e
-timeout 600 "$PY" "$SCRIPT"
+timeout 600 "$PY" "$SCRIPT" "$@"
 code=$?
 set -e
 
