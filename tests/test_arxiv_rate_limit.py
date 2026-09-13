@@ -389,6 +389,72 @@ class EmptyCacheTests(unittest.TestCase):
         fetch.assert_not_called()
 
 
+class KeywordBatchTests(unittest.TestCase):
+    def test_default_keywords_are_split_into_ten_ten_and_nine(self):
+        batches = paperfetch.chunked(paperfetch.KEYWORDS, paperfetch.KEYWORD_BATCH_SIZE)
+
+        self.assertEqual([len(batch) for batch in batches], [10, 10, 9])
+        self.assertEqual([keyword for batch in batches for keyword in batch], paperfetch.KEYWORDS)
+        self.assertEqual(paperfetch.BATCH_SLEEP_SECONDS, 300)
+
+    def test_three_network_batches_wait_twice_and_deduplicate_results(self):
+        seen_batches = []
+
+        def papers_from_feed(feed, batch):
+            seen_batches.append(list(batch))
+            return [
+                {
+                    "arxiv_id": "shared-paper",
+                    "title": f"Result from {feed.decode()}",
+                    "published": "2026-09-13",
+                }
+            ]
+
+        with (
+            patch.object(paperfetch, "rate_limited_fetch", side_effect=[b"batch-1", b"batch-2", b"batch-3"]) as fetch,
+            patch.object(paperfetch, "parse_feed", side_effect=lambda data: data),
+            patch.object(paperfetch, "papers_from_feed", side_effect=papers_from_feed),
+            patch.object(paperfetch.time, "sleep") as sleep,
+        ):
+            papers = paperfetch.fetch_arxiv_papers(
+                paperfetch.KEYWORDS,
+                ["cs.AI"],
+                days=7,
+                max_results=100,
+                no_cache=True,
+            )
+
+        self.assertEqual(fetch.call_count, 3)
+        self.assertEqual([len(batch) for batch in seen_batches], [10, 10, 9])
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [300, 300])
+        self.assertEqual(len(papers), 1)
+        self.assertEqual(papers[0]["title"], "Result from batch-3")
+
+    def test_cached_batch_does_not_add_a_network_wait(self):
+        keywords = [f"keyword-{index}" for index in range(21)]
+        cached_payload = json.dumps({"created_at": "2026-09-13T01:00:00+00:00"})
+
+        with (
+            patch.object(paperfetch, "load_cache", side_effect=[None, [], None]),
+            patch.object(Path, "read_text", return_value=cached_payload),
+            patch.object(paperfetch, "write_cache"),
+            patch.object(paperfetch, "rate_limited_fetch", return_value=b"feed") as fetch,
+            patch.object(paperfetch, "parse_feed", return_value=object()),
+            patch.object(paperfetch, "papers_from_feed", return_value=[]),
+            patch.object(paperfetch.time, "sleep") as sleep,
+        ):
+            paperfetch.fetch_arxiv_papers(
+                keywords,
+                ["cs.AI"],
+                days=7,
+                max_results=100,
+                no_cache=False,
+            )
+
+        self.assertEqual(fetch.call_count, 2)
+        sleep.assert_called_once_with(300)
+
+
 class CacheFallbackMainTests(unittest.TestCase):
     @staticmethod
     def args():

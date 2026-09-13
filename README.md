@@ -216,7 +216,7 @@ tail -200 /root/code/PaperFetch/log/run.log
 | ------ | ------- | ------ |
 | `PaperFetch.py` | Fetch recent arXiv papers for a single query/category setting | CSV file under `savefile/` |
 | `PaperFetch_daily.py` | Fetch recent papers from multiple categories, generate Markdown, and optionally send email | Markdown file under `savefile/`; email if enabled |
-| `PaperFrech_daily_keyword.py` | Fetch papers using one combined query, deduplicate, and send at most one topic-grouped HTML digest email | HTML email digest |
+| `PaperFrech_daily_keyword.py` | Fetch papers in rate-limited keyword batches, deduplicate, and send at most one topic-grouped HTML digest email | HTML email digest |
 | `run.sh` | Server wrapper for scheduled execution of `PaperFrech_daily_keyword.py` | Log file under `log/run.log` |
 
 ## Command Line Arguments
@@ -316,6 +316,8 @@ KEYWORDS = [keyword for topic_keywords in TOPICS.values() for keyword in topic_k
 DAYS = 7
 MAX_RESULTS = 100
 REQUEST_TIMEOUT = (10, 60)
+KEYWORD_BATCH_SIZE = 10
+BATCH_SLEEP_SECONDS = 300
 SMTP_HOST = "smtp.qq.com"
 ```
 
@@ -327,9 +329,16 @@ Meaning:
 | `TOPICS` | dict | Ordered Chinese topic names and their title/abstract matching keywords. A paper may match multiple topics. |
 | `KEYWORDS` | list | Automatically flattened search list derived from `TOPICS`; do not edit it separately. |
 | `DAYS` | int | Number of recent days to keep |
-| `MAX_RESULTS` | int | Maximum number of arXiv results requested for the combined query |
+| `MAX_RESULTS` | int | Maximum number of arXiv results requested for each keyword batch |
 | `REQUEST_TIMEOUT` | int | HTTP request timeout in seconds |
+| `KEYWORD_BATCH_SIZE` | int | Maximum number of keywords combined into each arXiv query |
+| `BATCH_SLEEP_SECONDS` | int | Delay between consecutive live keyword-batch requests |
 | `SMTP_HOST` | str | SMTP server host |
+
+The default 29-keyword configuration is queried in three ordered batches of 10, 10, and 9
+keywords. PaperFetch waits five minutes between consecutive live batch requests, but it does
+not wait after the final request or count a cache hit as a network request. Results from all
+batches are deduplicated by arXiv ID before the single digest is generated.
 
 ## Outputs
 

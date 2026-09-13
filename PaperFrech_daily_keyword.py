@@ -73,8 +73,8 @@ DAYS = 7
 MAX_RESULTS = 100
 REQUEST_TIMEOUT = (10, 60)
 MIN_ARXIV_INTERVAL_SECONDS = 10.0
-KEYWORD_BATCH_SIZE = 30
-BATCH_SLEEP_SECONDS = 120
+KEYWORD_BATCH_SIZE = 10
+BATCH_SLEEP_SECONDS = 300
 MAX_ARXIV_RETRIES = 3
 NORMAL_RETRY_DELAYS_SECONDS = (10.0, 30.0)
 DEFAULT_ARXIV_BUSY_WAIT_SECONDS = 300.0
@@ -792,6 +792,7 @@ def fetch_arxiv_papers(
     failures: list[str] = []
     successful_batches = 0
     fetched_times = []
+    attempted_network_batch = False
 
     for index, batch in enumerate(batches, 1):
         endpoint, request_params, raw_query = build_arxiv_request(categories, batch, days, max_results)
@@ -818,6 +819,11 @@ def fetch_arxiv_papers(
                 continue
 
         try:
+            if attempted_network_batch:
+                LOGGER.info("sleep %.2fs before next network keyword batch", BATCH_SLEEP_SECONDS)
+                time.sleep(BATCH_SLEEP_SECONDS)
+            attempted_network_batch = True
+
             if deferred_backoff is None:
                 data = rate_limited_fetch(endpoint, request_params)
             else:
@@ -843,10 +849,6 @@ def fetch_arxiv_papers(
             message = f"batch {index}/{len(batches)} failed: {exc!r}"
             failures.append(message)
             LOGGER.exception("arXiv keyword batch failed: %s", message)
-
-        if index < len(batches):
-            LOGGER.info("sleep %.2fs before next keyword batch", BATCH_SLEEP_SECONDS)
-            time.sleep(BATCH_SLEEP_SECONDS)
 
     if successful_batches == 0:
         detail = "; ".join(failures) if failures else "no keyword batches completed"
